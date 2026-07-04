@@ -1,0 +1,21 @@
+[package]
+name = "pyfixy-lsp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pyfixy-lsp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+lsp-types = "0.94"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+ruff_python_parser = "=0.0.3"
+ruff_python_ast = "=0.0.3"
+ruff_text_size = "=0.0.3"
+
+[dev-dependencies]
+tempfile = "3"

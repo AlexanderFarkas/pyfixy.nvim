@@ -1,0 +1,6 @@
+/target
+/bin
+.DS_Store
+
+# Local opt-in integration tests against private checkouts
+/tests/real_repo.rs

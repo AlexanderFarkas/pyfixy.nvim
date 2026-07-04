@@ -1,0 +1,1 @@
+-- intentionally empty; call require("pyfixy").setup()
