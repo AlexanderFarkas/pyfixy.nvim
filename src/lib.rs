@@ -58,13 +58,6 @@ pub struct DiagnosticConfig {
     pub mismatched_annotation: DiagnosticSeverity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FixtureTypeQuery {
-    pub name: String,
-    pub path: PathBuf,
-    pub position: Position,
-}
-
 impl Default for DiagnosticConfig {
     fn default() -> Self {
         Self {
@@ -147,34 +140,6 @@ impl FixtureIndex {
             uri: Url::from_file_path(&fixture.path).unwrap(),
             range: fixture.range,
         }))
-    }
-
-    pub fn external_type_queries_for_text(&self, file: &Path, text: &str) -> Vec<FixtureTypeQuery> {
-        let file = normalize_path(file);
-        self.visible_fixtures_for_text(&file, text)
-            .into_iter()
-            .filter(|fixture| fixture.return_annotation.is_none())
-            .map(|fixture| FixtureTypeQuery {
-                name: fixture.name.clone(),
-                path: fixture.path.clone(),
-                position: fixture.name_range.start,
-            })
-            .collect()
-    }
-
-    pub fn apply_external_annotations(&mut self, annotations: &HashMap<(PathBuf, String), String>) {
-        for fixture in &mut self.fixtures {
-            if fixture.return_annotation.is_some() {
-                continue;
-            }
-            let key = (normalize_path(&fixture.path), fixture.name.clone());
-            if let Some(text) = annotations.get(&key).filter(|text| !text.trim().is_empty()) {
-                fixture.return_annotation = Some(FixtureAnnotation {
-                    text: text.trim().to_string(),
-                    imports: Vec::new(),
-                });
-            }
-        }
     }
 
     pub fn diagnostics_for_text(
@@ -1561,6 +1526,111 @@ def root_client() -> RootClient: pass
     }
 
     #[test]
+    fn complex_fixture_annotation_imports_all_referenced_symbols() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+from collections.abc import Callable
+from typing import Optional
+from app.models import SomeType
+from app.results import AnotherType
+
+@pytest.fixture
+def factory() -> Callable[[Optional[SomeType]], AnotherType]: pass
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "def test_factory(factory): pass
+";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let actions = index
+            .code_actions_for_text_range(
+                &test,
+                text,
+                file_url(&test),
+                Some(Range {
+                    start: Position {
+                        line: 0,
+                        character: 17,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 17,
+                    },
+                }),
+            )
+            .unwrap();
+        let quickfix = actions
+            .iter()
+            .find(|action| action.title == "Add fixture type annotation")
+            .unwrap();
+        let edits = quickfix
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        let edit_text = edits
+            .iter()
+            .map(|edit| edit.new_text.as_str())
+            .collect::<String>();
+        assert!(edit_text.contains("from app.models import SomeType\n"));
+        assert!(edit_text.contains("from app.results import AnotherType\n"));
+        assert!(edit_text.contains("from collections.abc import Callable\n"));
+        assert!(edit_text.contains("from typing import Optional\n"));
+        assert!(edits
+            .iter()
+            .any(|edit| edit.new_text == ": Callable[[Optional[SomeType]], AnotherType]"));
+    }
+
+    #[test]
+    fn imports_are_inserted_after_multiline_import_block() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+from fastapi.testclient import TestClient
+
+@pytest.fixture
+def client() -> TestClient: pass
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "from app.module import (\n    Existing,\n)\n\ndef test_client(client): pass\n";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let actions = index
+            .code_actions_for_text_range(&test, text, file_url(&test), None)
+            .unwrap();
+        let quickfix = actions
+            .iter()
+            .find(|action| action.title == "Add fixture type annotation")
+            .unwrap();
+        let edits = quickfix
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        let import_edit = edits
+            .iter()
+            .find(|edit| edit.new_text == "from fastapi.testclient import TestClient\n")
+            .unwrap();
+        assert_eq!(import_edit.range.start.line, 3);
+        assert_eq!(import_edit.range.start.character, 0);
+    }
+
+    #[test]
     fn code_actions_add_import_and_replace_or_insert_annotation() {
         let tmp = TempDir::new().unwrap();
         write(
@@ -1935,13 +2005,43 @@ fn import_exists(text: &str, req: &ImportRequirement) -> bool {
 }
 
 fn import_insert_line(text: &str) -> u32 {
+    if let Ok(parsed) = parse_module(text) {
+        if !parsed.has_invalid_syntax() {
+            let mut line = 0;
+            for stmt in &parsed.syntax().body {
+                if matches!(stmt, Stmt::Import(_) | Stmt::ImportFrom(_)) {
+                    let end = range_for_text_range(text, stmt.range()).end;
+                    line = if end.character == 0 {
+                        end.line
+                    } else {
+                        end.line + 1
+                    };
+                } else if !source_for_range(text, stmt.range())
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+                {
+                    break;
+                }
+            }
+            return line;
+        }
+    }
+
     let mut last = 0;
     for (idx, line) in text.lines().enumerate() {
         let t = line.trim_start();
-        if t.starts_with("import ")
-            || t.starts_with("from ")
-            || t.is_empty() && idx == last as usize
-        {
+        if t.starts_with("import ") || t.starts_with("from ") {
+            last = idx as u32 + 1;
+            if t.ends_with('(') {
+                for (nested_idx, nested_line) in text.lines().enumerate().skip(idx + 1) {
+                    last = nested_idx as u32 + 1;
+                    if nested_line.trim_end().ends_with(')') {
+                        break;
+                    }
+                }
+            }
+        } else if t.is_empty() && idx == last as usize {
             last = idx as u32 + 1;
         } else if !t.is_empty() {
             break;
