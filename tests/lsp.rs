@@ -78,6 +78,15 @@ fn write(path: &std::path::Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
+fn read_until_publish_diagnostics(lsp: &mut Lsp) -> Value {
+    loop {
+        let msg = lsp.read();
+        if msg.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics") {
+            return msg;
+        }
+    }
+}
+
 #[test]
 fn initialize_advertises_completion_and_definition() {
     let tmp = TempDir::new().unwrap();
@@ -90,6 +99,7 @@ fn initialize_advertises_completion_and_definition() {
     assert!(caps.get("completionProvider").is_some());
     assert_eq!(caps["definitionProvider"], true);
     assert_eq!(caps["referencesProvider"], true);
+    assert_eq!(caps["codeActionProvider"], true);
 }
 
 #[test]
@@ -191,4 +201,85 @@ fn completion_and_definition_work_over_stdio() {
         .unwrap()
         .iter()
         .any(|loc| loc["uri"] == test_uri));
+}
+
+#[test]
+fn publishes_fixture_annotation_diagnostics_with_configured_severity() {
+    let tmp = TempDir::new().unwrap();
+    let conftest = tmp.path().join("tests/conftest.py");
+    let test = tmp.path().join("tests/test_app.py");
+    write(
+        &conftest,
+        "import pytest\n@pytest.fixture\ndef db() -> Session: pass\n",
+    );
+    write(&test, "def test_db(db): pass\n");
+
+    let mut lsp = Lsp::start();
+    lsp.request(
+        "initialize",
+        json!({
+            "rootUri": url::Url::from_directory_path(tmp.path()).unwrap(),
+            "initializationOptions": { "diagnostics": { "missing_annotation": "warning" } }
+        }),
+    );
+    lsp.send(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": url::Url::from_file_path(&test).unwrap(),
+                "languageId": "python",
+                "version": 1,
+                "text": "def test_db(db): pass\n"
+            }
+        }
+    }));
+    let notification = read_until_publish_diagnostics(&mut lsp);
+    assert_eq!(notification["params"]["diagnostics"][0]["severity"], 2);
+    assert!(notification["params"]["diagnostics"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Session"));
+}
+
+#[test]
+fn code_action_returns_fixture_annotation_edits_over_stdio() {
+    let tmp = TempDir::new().unwrap();
+    let conftest = tmp.path().join("tests/conftest.py");
+    let test = tmp.path().join("tests/test_app.py");
+    write(
+        &conftest,
+        "import pytest\nfrom app.models import User\n@pytest.fixture\ndef user() -> User: pass\n",
+    );
+    write(&test, "def test_user(user): pass\n");
+
+    let mut lsp = Lsp::start();
+    lsp.request(
+        "initialize",
+        json!({ "rootUri": url::Url::from_directory_path(tmp.path()).unwrap() }),
+    );
+    let response = lsp.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": { "uri": url::Url::from_file_path(&test).unwrap() },
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
+            "context": { "diagnostics": [] }
+        }),
+    );
+    let actions = response["result"].as_array().unwrap();
+    assert!(actions
+        .iter()
+        .any(|a| a["title"] == "Add fixture type annotations in file"));
+    let edits = actions[0]["edit"]["changes"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert!(edits
+        .iter()
+        .any(|e| e["newText"] == "from app.models import User\n"));
+    assert!(edits.iter().any(|e| e["newText"] == ": User"));
 }

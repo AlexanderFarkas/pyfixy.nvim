@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use lsp_types::*;
-use pyfixy_lsp::FixtureIndex;
+use pyfixy_lsp::{DiagnosticConfig, FixtureIndex};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -13,10 +13,20 @@ fn main() -> Result<()> {
     Server::default().run()
 }
 
-#[derive(Default)]
 struct Server {
     root: Option<PathBuf>,
     documents: HashMap<PathBuf, String>,
+    diagnostics: DiagnosticConfig,
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self {
+            root: None,
+            documents: HashMap::new(),
+            diagnostics: DiagnosticConfig::default(),
+        }
+    }
 }
 
 impl Server {
@@ -33,8 +43,9 @@ impl Server {
                 let id = v.get("id").cloned();
                 match (id, method) {
                     (Some(id), "initialize") => {
-                        self.root =
-                            root_from_initialize(v.get("params").cloned().unwrap_or_default());
+                        let init_params = v.get("params").cloned().unwrap_or_default();
+                        self.root = root_from_initialize(init_params.clone());
+                        self.diagnostics = diagnostics_from_initialize(init_params);
                         send(
                             &mut output,
                             json!({"jsonrpc":"2.0","id":id,"result": InitializeResult {
@@ -42,6 +53,7 @@ impl Server {
                                     completion_provider: Some(CompletionOptions::default()),
                                     definition_provider: Some(OneOf::Left(true)),
                                     references_provider: Some(OneOf::Left(true)),
+                                    code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                                     text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
                                     ..Default::default()
                                 },
@@ -73,14 +85,43 @@ impl Server {
                             json!({"jsonrpc":"2.0","id":id,"result":result}),
                         )?;
                     }
+                    (Some(id), "textDocument/codeAction") => {
+                        let result =
+                            self.handle_code_action(v.get("params").cloned().unwrap_or_default())?;
+                        send(
+                            &mut output,
+                            json!({"jsonrpc":"2.0","id":id,"result":result}),
+                        )?;
+                    }
                     (Option::None, "textDocument/didOpen") => {
-                        self.handle_did_open(v.get("params").cloned().unwrap_or_default())?;
+                        if let Some((uri, diagnostics)) =
+                            self.handle_did_open(v.get("params").cloned().unwrap_or_default())?
+                        {
+                            send(
+                                &mut output,
+                                json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":uri,"diagnostics":diagnostics}}),
+                            )?;
+                        }
                     }
                     (Option::None, "textDocument/didChange") => {
-                        self.handle_did_change(v.get("params").cloned().unwrap_or_default())?;
+                        if let Some((uri, diagnostics)) =
+                            self.handle_did_change(v.get("params").cloned().unwrap_or_default())?
+                        {
+                            send(
+                                &mut output,
+                                json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":uri,"diagnostics":diagnostics}}),
+                            )?;
+                        }
                     }
                     (Option::None, "textDocument/didClose") => {
-                        self.handle_did_close(v.get("params").cloned().unwrap_or_default())?;
+                        if let Some(uri) =
+                            self.handle_did_close(v.get("params").cloned().unwrap_or_default())?
+                        {
+                            send(
+                                &mut output,
+                                json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":uri,"diagnostics":[]}}),
+                            )?;
+                        }
                     }
                     (Some(id), "shutdown") => {
                         send(&mut output, json!({"jsonrpc":"2.0","id":id,"result":null}))?
@@ -130,30 +171,42 @@ impl Server {
             .map(GotoDefinitionResponse::Scalar))
     }
 
-    fn handle_did_open(&mut self, params: Value) -> Result<()> {
+    fn handle_did_open(&mut self, params: Value) -> Result<Option<(Url, Vec<Diagnostic>)>> {
         let params: DidOpenTextDocumentParams = serde_json::from_value(params)?;
-        if let Ok(path) = params.text_document.uri.to_file_path() {
-            self.documents.insert(path, params.text_document.text);
+        let uri = params.text_document.uri;
+        if let Ok(path) = uri.to_file_path() {
+            let text = params.text_document.text;
+            let diagnostics = self
+                .index()?
+                .diagnostics_for_text(&path, &text, self.diagnostics)?;
+            self.documents.insert(path, text);
+            return Ok(Some((uri, diagnostics)));
         }
-        Ok(())
+        Ok(None)
     }
 
-    fn handle_did_change(&mut self, params: Value) -> Result<()> {
+    fn handle_did_change(&mut self, params: Value) -> Result<Option<(Url, Vec<Diagnostic>)>> {
         let params: DidChangeTextDocumentParams = serde_json::from_value(params)?;
-        if let Ok(path) = params.text_document.uri.to_file_path() {
+        let uri = params.text_document.uri;
+        if let Ok(path) = uri.to_file_path() {
             if let Some(change) = params.content_changes.into_iter().last() {
+                let diagnostics =
+                    self.index()?
+                        .diagnostics_for_text(&path, &change.text, self.diagnostics)?;
                 self.documents.insert(path, change.text);
+                return Ok(Some((uri, diagnostics)));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
-    fn handle_did_close(&mut self, params: Value) -> Result<()> {
+    fn handle_did_close(&mut self, params: Value) -> Result<Option<Url>> {
         let params: DidCloseTextDocumentParams = serde_json::from_value(params)?;
         if let Ok(path) = params.text_document.uri.to_file_path() {
             self.documents.remove(&path);
+            return Ok(Some(params.text_document.uri));
         }
-        Ok(())
+        Ok(None)
     }
 
     fn handle_references(&self, params: Value) -> Result<Vec<Location>> {
@@ -166,6 +219,48 @@ impl Server {
             .unwrap();
         self.index()?
             .references(&path, params.text_document_position.position)
+    }
+
+    fn handle_code_action(&self, params: Value) -> Result<Vec<CodeAction>> {
+        let params: CodeActionParams = serde_json::from_value(params)?;
+        let uri = params.text_document.uri;
+        let path = uri.to_file_path().unwrap();
+        let text = self
+            .documents
+            .get(&path)
+            .cloned()
+            .unwrap_or_else(|| std::fs::read_to_string(&path).unwrap_or_default());
+        self.index()?.code_actions_for_text(&path, &text, uri)
+    }
+}
+
+fn diagnostics_from_initialize(params: Value) -> DiagnosticConfig {
+    let mut config = DiagnosticConfig::default();
+    let diagnostics = params
+        .get("initializationOptions")
+        .and_then(|v| v.get("diagnostics"));
+    if let Some(v) = diagnostics
+        .and_then(|d| d.get("missing_annotation"))
+        .and_then(Value::as_str)
+    {
+        config.missing_annotation = severity_from_str(v).unwrap_or(config.missing_annotation);
+    }
+    if let Some(v) = diagnostics
+        .and_then(|d| d.get("mismatched_annotation"))
+        .and_then(Value::as_str)
+    {
+        config.mismatched_annotation = severity_from_str(v).unwrap_or(config.mismatched_annotation);
+    }
+    config
+}
+
+fn severity_from_str(value: &str) -> Option<DiagnosticSeverity> {
+    match value.to_ascii_lowercase().as_str() {
+        "error" => Some(DiagnosticSeverity::ERROR),
+        "warning" | "warn" => Some(DiagnosticSeverity::WARNING),
+        "information" | "info" => Some(DiagnosticSeverity::INFORMATION),
+        "hint" => Some(DiagnosticSeverity::HINT),
+        _ => None,
     }
 }
 

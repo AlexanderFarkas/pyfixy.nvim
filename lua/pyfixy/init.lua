@@ -14,6 +14,10 @@ local defaults = {
   cmd = default_cmd(),
   ty_client_names = { "ty" },
   name = "pyfixy-lsp",
+  diagnostics = {
+    missing_annotation = "hint",
+    mismatched_annotation = "error",
+  },
 }
 local config = vim.deepcopy(defaults)
 local started_by_root = {}
@@ -62,6 +66,9 @@ local function start(bufnr, ty)
     root_dir = root,
     filetypes = { "python" },
     single_file_support = false,
+    init_options = {
+      diagnostics = config.diagnostics,
+    },
   }, { bufnr = bufnr })
 
   if id then

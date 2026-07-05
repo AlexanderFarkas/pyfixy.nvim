@@ -1,7 +1,12 @@
 use anyhow::Result;
-use lsp_types::{CompletionItem, CompletionItemKind, Location, Position, Range, Url};
+use lsp_types::{
+    CodeAction, CodeActionKind, CompletionItem, CompletionItemKind, Diagnostic, DiagnosticSeverity,
+    Location, Position, Range, TextEdit, Url, WorkspaceEdit,
+};
 use ruff_python_ast::Decorator;
-use ruff_python_ast::{Expr, ExprCall, ExprName, ExprStringLiteral, Stmt, StmtFunctionDef};
+use ruff_python_ast::{
+    Expr, ExprCall, ExprName, ExprStringLiteral, Parameter, Stmt, StmtFunctionDef,
+};
 use ruff_python_parser::parse_module;
 use ruff_text_size::{Ranged, TextSize};
 use std::{
@@ -17,6 +22,49 @@ pub struct Fixture {
     pub visibility_path: PathBuf,
     pub range: Range,
     pub name_range: Range,
+    pub return_annotation: Option<FixtureAnnotation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixtureAnnotation {
+    pub text: String,
+    pub imports: Vec<ImportRequirement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ImportRequirement {
+    pub module: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationDiagnosticKind {
+    Missing,
+    Mismatched,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixtureAnnotationDiagnostic {
+    pub kind: AnnotationDiagnosticKind,
+    pub fixture_name: String,
+    pub fixture_annotation: String,
+    pub range: Range,
+    pub edit_range: Range,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DiagnosticConfig {
+    pub missing_annotation: DiagnosticSeverity,
+    pub mismatched_annotation: DiagnosticSeverity,
+}
+
+impl Default for DiagnosticConfig {
+    fn default() -> Self {
+        Self {
+            missing_annotation: DiagnosticSeverity::HINT,
+            mismatched_annotation: DiagnosticSeverity::ERROR,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -53,11 +101,21 @@ impl FixtureIndex {
         Ok(self
             .visible_fixtures_for_text(file, text)
             .into_iter()
-            .map(|f| CompletionItem {
-                label: f.name.clone(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                detail: Some(format!("pytest fixture ({})", f.path.display())),
-                ..Default::default()
+            .map(|f| {
+                let mut item = CompletionItem {
+                    label: f.name.clone(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    detail: Some(format!("pytest fixture ({})", f.path.display())),
+                    ..Default::default()
+                };
+                if let Some(annotation) = &f.return_annotation {
+                    item.insert_text = Some(format!("{}: {}", f.name, annotation.text));
+                    let edits = import_text_edits(text, annotation);
+                    if !edits.is_empty() {
+                        item.additional_text_edits = Some(edits);
+                    }
+                }
+                item
             })
             .collect())
     }
@@ -81,6 +139,125 @@ impl FixtureIndex {
             uri: Url::from_file_path(&fixture.path).unwrap(),
             range: fixture.range,
         }))
+    }
+
+    pub fn diagnostics_for_text(
+        &self,
+        file: &Path,
+        text: &str,
+        config: DiagnosticConfig,
+    ) -> Result<Vec<Diagnostic>> {
+        Ok(self
+            .annotation_diagnostics_for_text(file, text)?
+            .into_iter()
+            .map(|d| Diagnostic {
+                range: d.range,
+                severity: Some(match d.kind {
+                    AnnotationDiagnosticKind::Missing => config.missing_annotation,
+                    AnnotationDiagnosticKind::Mismatched => config.mismatched_annotation,
+                }),
+                source: Some("pyfixy".into()),
+                message: match d.kind {
+                    AnnotationDiagnosticKind::Missing => format!(
+                        "Fixture `{}` returns `{}`; parameter is missing an annotation",
+                        d.fixture_name, d.fixture_annotation
+                    ),
+                    AnnotationDiagnosticKind::Mismatched => format!(
+                        "Fixture `{}` returns `{}`, but parameter has a different annotation",
+                        d.fixture_name, d.fixture_annotation
+                    ),
+                },
+                ..Default::default()
+            })
+            .collect())
+    }
+
+    pub fn annotation_diagnostics_for_text(
+        &self,
+        file: &Path,
+        text: &str,
+    ) -> Result<Vec<FixtureAnnotationDiagnostic>> {
+        let visible: HashMap<String, &Fixture> = self
+            .visible_fixtures_for_text(file, text)
+            .into_iter()
+            .map(|fixture| (fixture.name.clone(), fixture))
+            .collect();
+        Ok(parameter_annotation_infos(text)
+            .into_iter()
+            .filter_map(|param| {
+                let fixture = visible.get(&param.name)?;
+                let fixture_annotation = fixture.return_annotation.as_ref()?;
+                match param.annotation {
+                    std::option::Option::None => Some(FixtureAnnotationDiagnostic {
+                        kind: AnnotationDiagnosticKind::Missing,
+                        fixture_name: param.name,
+                        fixture_annotation: fixture_annotation.text.clone(),
+                        range: param.name_range,
+                        edit_range: param.name_range,
+                    }),
+                    Some((text_annotation, range))
+                        if !annotations_equivalent(
+                            &text_annotation,
+                            &fixture_annotation.text,
+                            file,
+                            text,
+                            fixture,
+                        ) =>
+                    {
+                        Some(FixtureAnnotationDiagnostic {
+                            kind: AnnotationDiagnosticKind::Mismatched,
+                            fixture_name: param.name,
+                            fixture_annotation: fixture_annotation.text.clone(),
+                            range,
+                            edit_range: range,
+                        })
+                    }
+                    _ => None,
+                }
+            })
+            .collect())
+    }
+
+    pub fn code_actions_for_text(
+        &self,
+        file: &Path,
+        text: &str,
+        uri: Url,
+    ) -> Result<Vec<CodeAction>> {
+        let diagnostics = self.annotation_diagnostics_for_text(file, text)?;
+        let visible: HashMap<String, &Fixture> = self
+            .visible_fixtures_for_text(file, text)
+            .into_iter()
+            .map(|fixture| (fixture.name.clone(), fixture))
+            .collect();
+        let mut actions = Vec::new();
+        for d in &diagnostics {
+            let Some(fixture) = visible.get(&d.fixture_name) else {
+                continue;
+            };
+            let edits = edits_for_annotation(text, d, fixture);
+            actions.push(CodeAction {
+                title: "Add fixture type annotation".into(),
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(workspace_edit(uri.clone(), edits)),
+                ..Default::default()
+            });
+        }
+        if !diagnostics.is_empty() {
+            let mut edits = Vec::new();
+            for d in &diagnostics {
+                if let Some(fixture) = visible.get(&d.fixture_name) {
+                    edits.extend(edits_for_annotation(text, d, fixture));
+                }
+            }
+            actions.push(CodeAction {
+                title: "Add fixture type annotations in file".into(),
+                kind: Some(CodeActionKind::SOURCE),
+                edit: Some(workspace_edit(uri, dedupe_text_edits(edits))),
+                ..Default::default()
+            });
+        }
+        Ok(actions)
     }
 
     pub fn references(&self, file: &Path, position: Position) -> Result<Vec<Location>> {
@@ -477,6 +654,7 @@ fn collect_stmt_fixtures(path: &Path, text: &str, stmt: &Stmt, fixtures: &mut Ve
                     visibility_path: path.to_path_buf(),
                     range: range_for_text_range(text, func.range()),
                     name_range,
+                    return_annotation: fixture_return_annotation(path, text, func),
                 });
             }
         }
@@ -1164,4 +1342,554 @@ mod tests {
             .unwrap();
         assert_eq!(location.uri, Url::from_file_path(conftest).unwrap());
     }
+
+    #[test]
+    fn fixtures_capture_return_annotation_and_imports() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("tests/conftest.py");
+        write(
+            &file,
+            "import pytest
+from starlette.testclient import TestClient
+
+@pytest.fixture
+def admin_client() -> TestClient: pass
+",
+        );
+        let fixtures = fixtures_in_text(&file, &fs::read_to_string(&file).unwrap());
+        let ann = fixtures[0].return_annotation.as_ref().unwrap();
+        assert_eq!(ann.text, "TestClient");
+        assert_eq!(
+            ann.imports,
+            vec![ImportRequirement {
+                module: "starlette.testclient".into(),
+                name: "TestClient".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn diagnostics_report_missing_and_mismatched_fixture_annotations() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+@pytest.fixture
+def db() -> Session: pass
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "def test_one(db): pass
+def test_two(db: str): pass
+";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let diags = index.annotation_diagnostics_for_text(&test, text).unwrap();
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags[0].kind, AnnotationDiagnosticKind::Missing);
+        assert_eq!(diags[1].kind, AnnotationDiagnosticKind::Mismatched);
+    }
+
+    #[test]
+    fn code_actions_add_import_and_replace_or_insert_annotation() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+from app.models import User
+@pytest.fixture
+def user() -> User: pass
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "def test_user(user): pass
+";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let actions = index
+            .code_actions_for_text(&test, text, Url::from_file_path(&test).unwrap())
+            .unwrap();
+        let edits = actions[0]
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        assert!(edits.iter().any(|e| e.new_text
+            == "from app.models import User
+"));
+        assert!(edits.iter().any(|e| e.new_text == ": User"));
+    }
+
+    #[test]
+    fn imported_and_qualified_annotations_are_equivalent() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+from starlette.testclient import TestClient
+@pytest.fixture
+def admin_client() -> TestClient: pass
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "import starlette.testclient
+
+def test_x(admin_client: starlette.testclient.TestClient): pass
+";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let diags = index.annotation_diagnostics_for_text(&test, text).unwrap();
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn completion_inserts_annotation_and_import_edit() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+from starlette.testclient import TestClient
+@pytest.fixture
+def admin_client() -> TestClient: pass
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "def test_x(admin_): pass
+";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let items = index
+            .completions_for_text(
+                &test,
+                text,
+                Position {
+                    line: 0,
+                    character: 17,
+                },
+            )
+            .unwrap();
+        let item = items.iter().find(|i| i.label == "admin_client").unwrap();
+        assert_eq!(
+            item.insert_text.as_deref(),
+            Some("admin_client: TestClient")
+        );
+        assert!(item
+            .additional_text_edits
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|e| e.new_text
+                == "from starlette.testclient import TestClient
+"));
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParameterAnnotationInfo {
+    name: String,
+    name_range: Range,
+    annotation: Option<(String, Range)>,
+}
+
+fn fixture_return_annotation(
+    path: &Path,
+    text: &str,
+    func: &StmtFunctionDef,
+) -> Option<FixtureAnnotation> {
+    let returns = func.returns.as_ref()?;
+    let annotation_text = source_for_range(text, returns.range())?.trim().to_string();
+    Some(FixtureAnnotation {
+        imports: imports_for_annotation(path, text, &annotation_text),
+        text: annotation_text,
+    })
+}
+
+fn source_for_range(text: &str, range: ruff_text_size::TextRange) -> Option<&str> {
+    let start = u32::from(range.start()) as usize;
+    let end = u32::from(range.end()) as usize;
+    text.get(start..end)
+}
+
+fn parameter_annotation_infos(text: &str) -> Vec<ParameterAnnotationInfo> {
+    let Ok(parsed) = parse_module(text) else {
+        return Vec::new();
+    };
+    if parsed.has_invalid_syntax() {
+        return Vec::new();
+    }
+    let mut infos = Vec::new();
+    collect_parameter_annotation_infos(&parsed.syntax().body, text, &mut infos);
+    infos
+}
+
+fn collect_parameter_annotation_infos(
+    body: &[Stmt],
+    text: &str,
+    infos: &mut Vec<ParameterAnnotationInfo>,
+) {
+    for stmt in body {
+        match stmt {
+            Stmt::FunctionDef(func) => {
+                for parameter in func.parameters.iter() {
+                    if let Some(info) = parameter_annotation_info(text, parameter.as_parameter()) {
+                        infos.push(info);
+                    }
+                }
+                collect_parameter_annotation_infos(&func.body, text, infos);
+            }
+            Stmt::ClassDef(class) => collect_parameter_annotation_infos(&class.body, text, infos),
+            _ => {}
+        }
+    }
+}
+
+fn parameter_annotation_info(text: &str, parameter: &Parameter) -> Option<ParameterAnnotationInfo> {
+    let name = parameter.name().as_str().to_string();
+    let param_src = source_for_range(text, parameter.range())?;
+    let param_start = u32::from(parameter.range().start()) as usize;
+    let name_offset = param_src.find(&name)?;
+    let name_range = Range {
+        start: byte_to_position(text, TextSize::new((param_start + name_offset) as u32)),
+        end: byte_to_position(
+            text,
+            TextSize::new((param_start + name_offset + name.len()) as u32),
+        ),
+    };
+    let annotation = parameter.annotation().and_then(|ann| {
+        let ann_text = source_for_range(text, ann.range())?.trim().to_string();
+        Some((ann_text, range_for_text_range(text, ann.range())))
+    });
+    Some(ParameterAnnotationInfo {
+        name,
+        name_range,
+        annotation,
+    })
+}
+
+fn imports_for_annotation(path: &Path, text: &str, annotation: &str) -> Vec<ImportRequirement> {
+    let imported = import_resolution_map(path, text);
+    let mut result = Vec::new();
+    for symbol in annotation_symbols(annotation) {
+        if let Some(req) = imported.get(&symbol) {
+            result.push(req.clone());
+        } else if is_likely_local_type(&symbol, text) {
+            if let Some(module) = module_name_for_path(path) {
+                result.push(ImportRequirement {
+                    module,
+                    name: symbol,
+                });
+            }
+        }
+    }
+    result.sort_by(|a, b| a.module.cmp(&b.module).then(a.name.cmp(&b.name)));
+    result.dedup();
+    result
+}
+
+fn import_resolution_map(path: &Path, text: &str) -> HashMap<String, ImportRequirement> {
+    let Ok(parsed) = parse_module(text) else {
+        return HashMap::new();
+    };
+    if parsed.has_invalid_syntax() {
+        return HashMap::new();
+    }
+    let mut map = HashMap::new();
+    for stmt in &parsed.syntax().body {
+        match stmt {
+            Stmt::Import(import) => {
+                for alias in &import.names {
+                    let module = alias.name.as_str().to_string();
+                    let visible = alias
+                        .asname
+                        .as_ref()
+                        .map(|a| a.as_str())
+                        .unwrap_or_else(|| module.split('.').next().unwrap_or(&module));
+                    map.insert(
+                        visible.to_string(),
+                        ImportRequirement {
+                            module,
+                            name: String::new(),
+                        },
+                    );
+                }
+            }
+            Stmt::ImportFrom(import_from) => {
+                let module = resolve_import_from_module(
+                    path,
+                    import_from.level,
+                    import_from.module.as_ref().map(|m| m.as_str()),
+                );
+                let Some(module) = module else {
+                    continue;
+                };
+                for alias in &import_from.names {
+                    if alias.name.as_str() == "*" {
+                        continue;
+                    }
+                    let visible = alias
+                        .asname
+                        .as_ref()
+                        .unwrap_or(&alias.name)
+                        .as_str()
+                        .to_string();
+                    map.insert(
+                        visible,
+                        ImportRequirement {
+                            module: module.clone(),
+                            name: alias.name.as_str().to_string(),
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
+fn resolve_import_from_module(path: &Path, level: u32, module: Option<&str>) -> Option<String> {
+    if level == 0 {
+        return module.map(str::to_string);
+    }
+    let current = module_name_for_path(path)?;
+    let mut parts: Vec<&str> = current.split('.').collect();
+    parts.pop();
+    for _ in 1..level {
+        parts.pop();
+    }
+    if let Some(module) = module {
+        if !module.is_empty() {
+            parts.extend(module.split('.'));
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("."))
+}
+
+fn module_name_for_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let mut parts = if stem == "__init__" {
+        Vec::new()
+    } else {
+        vec![stem.to_string()]
+    };
+    let mut dir = path.parent()?;
+    while dir.join("__init__.py").exists() {
+        parts.push(dir.file_name()?.to_str()?.to_string());
+        let Some(parent) = dir.parent() else {
+            break;
+        };
+        dir = parent;
+    }
+    parts.reverse();
+    if parts.is_empty() {
+        path.parent()?.file_name()?.to_str().map(str::to_string)
+    } else {
+        Some(parts.join("."))
+    }
+}
+
+fn is_likely_local_type(symbol: &str, text: &str) -> bool {
+    text.contains(&format!("class {symbol}")) || text.contains(&format!("{symbol} ="))
+}
+
+fn annotation_symbols(annotation: &str) -> Vec<String> {
+    let builtins = [
+        "None", "list", "dict", "set", "tuple", "str", "int", "float", "bool", "bytes",
+    ];
+    let mut symbols = Vec::new();
+    let bytes = annotation.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'_' || bytes[i].is_ascii_alphabetic() {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_ident(bytes[i]) {
+                i += 1;
+            }
+            let Some(name) = annotation.get(start..i) else {
+                continue;
+            };
+            let prev = annotation
+                .get(..start)
+                .unwrap_or_default()
+                .chars()
+                .rev()
+                .find(|c| !c.is_whitespace());
+            if prev != Some('.') && !builtins.contains(&name) && !symbols.iter().any(|s| s == name)
+            {
+                symbols.push(name.to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    symbols
+}
+
+fn import_text_edits(text: &str, annotation: &FixtureAnnotation) -> Vec<TextEdit> {
+    let mut edits = Vec::new();
+    for req in &annotation.imports {
+        if import_exists(text, req) {
+            continue;
+        }
+        let line = import_insert_line(text);
+        let new_text = if req.name.is_empty() {
+            format!("import {}\n", req.module)
+        } else {
+            format!("from {} import {}\n", req.module, req.name)
+        };
+        edits.push(TextEdit {
+            range: Range {
+                start: Position { line, character: 0 },
+                end: Position { line, character: 0 },
+            },
+            new_text,
+        });
+    }
+    edits
+}
+
+fn import_exists(text: &str, req: &ImportRequirement) -> bool {
+    if req.name.is_empty() {
+        text.lines()
+            .any(|l| l.trim() == format!("import {}", req.module))
+    } else {
+        text.lines()
+            .any(|l| l.trim() == format!("from {} import {}", req.module, req.name))
+    }
+}
+
+fn import_insert_line(text: &str) -> u32 {
+    let mut last = 0;
+    for (idx, line) in text.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("import ")
+            || t.starts_with("from ")
+            || t.is_empty() && idx == last as usize
+        {
+            last = idx as u32 + 1;
+        } else if !t.is_empty() {
+            break;
+        }
+    }
+    last
+}
+
+fn edits_for_annotation(
+    text: &str,
+    diag: &FixtureAnnotationDiagnostic,
+    fixture: &Fixture,
+) -> Vec<TextEdit> {
+    let Some(annotation) = &fixture.return_annotation else {
+        return Vec::new();
+    };
+    let mut edits = import_text_edits(text, annotation);
+    let new_text = match diag.kind {
+        AnnotationDiagnosticKind::Missing => format!(": {}", diag.fixture_annotation),
+        AnnotationDiagnosticKind::Mismatched => diag.fixture_annotation.clone(),
+    };
+    let range = match diag.kind {
+        AnnotationDiagnosticKind::Missing => Range {
+            start: diag.edit_range.end,
+            end: diag.edit_range.end,
+        },
+        AnnotationDiagnosticKind::Mismatched => diag.edit_range,
+    };
+    edits.push(TextEdit { range, new_text });
+    edits
+}
+
+fn dedupe_text_edits(edits: Vec<TextEdit>) -> Vec<TextEdit> {
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for edit in edits {
+        let key = (
+            edit.range.start.line,
+            edit.range.start.character,
+            edit.range.end.line,
+            edit.range.end.character,
+            edit.new_text.clone(),
+        );
+        if seen.insert(key) {
+            result.push(edit);
+        }
+    }
+    result
+}
+
+fn workspace_edit(uri: Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
+    let mut changes = HashMap::new();
+    changes.insert(uri, edits);
+    WorkspaceEdit {
+        changes: Some(changes),
+        ..Default::default()
+    }
+}
+
+fn annotations_equivalent(
+    left: &str,
+    right: &str,
+    test_file: &Path,
+    test_text: &str,
+    fixture: &Fixture,
+) -> bool {
+    let norm = |s: &str| s.split_whitespace().collect::<String>();
+    if norm(left) == norm(right) {
+        return true;
+    }
+    let test_imports = import_resolution_map(test_file, test_text);
+    let fixture_imports = fs::read_to_string(&fixture.path)
+        .map(|s| import_resolution_map(&fixture.path, &s))
+        .unwrap_or_default();
+    canonical_annotation(left, &test_imports) == canonical_annotation(right, &fixture_imports)
+}
+
+fn canonical_annotation(annotation: &str, imports: &HashMap<String, ImportRequirement>) -> String {
+    let mut out = annotation.split_whitespace().collect::<String>();
+    for (visible, req) in imports {
+        if req.name.is_empty()
+            && req
+                .module
+                .split('.')
+                .next()
+                .is_some_and(|first| first == visible)
+        {
+            continue;
+        }
+        let replacement = if req.name.is_empty() {
+            req.module.clone()
+        } else {
+            format!("{}.{}", req.module, req.name)
+        };
+        out = replace_word(&out, visible, &replacement);
+    }
+    out
+}
+
+fn replace_word(text: &str, word: &str, replacement: &str) -> String {
+    let mut out = String::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if (bytes[i] == b'_' || bytes[i].is_ascii_alphabetic())
+            && text.get(i..).is_some_and(|suffix| suffix.starts_with(word))
+        {
+            let end = i + word.len();
+            let before_ok = i == 0 || !is_ident(bytes[i - 1]);
+            let after_ok = end >= bytes.len() || !is_ident(bytes[end]);
+            if before_ok && after_ok {
+                out.push_str(replacement);
+                i = end;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
