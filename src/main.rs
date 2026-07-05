@@ -19,6 +19,7 @@ struct Server {
     diagnostics: DiagnosticConfig,
     next_client_request_id: u64,
     ty_bridge: bool,
+    ty_annotations: HashMap<(PathBuf, String), String>,
 }
 
 impl Default for Server {
@@ -29,6 +30,7 @@ impl Default for Server {
             diagnostics: DiagnosticConfig::default(),
             next_client_request_id: 1_000_000,
             ty_bridge: false,
+            ty_annotations: HashMap::new(),
         }
     }
 }
@@ -168,7 +170,7 @@ impl Server {
         let mut index = self.index()?;
         let path = normalize_path(&path);
         if let Some(text) = self.documents.get(&path).cloned() {
-            self.enrich_index_with_ty(&mut index, &path, &text, input, output)?;
+            self.enrich_index_with_ty(&mut index, &path, &text, input, output, true)?;
             index.completions_for_text(&path, &text, params.text_document_position.position)
         } else {
             index.completions(&path, params.text_document_position.position)
@@ -258,7 +260,7 @@ impl Server {
             .cloned()
             .unwrap_or_else(|| std::fs::read_to_string(&path).unwrap_or_default());
         let mut index = self.index()?;
-        self.enrich_index_with_ty(&mut index, &path, &text, input, output)?;
+        self.enrich_index_with_ty(&mut index, &path, &text, input, output, true)?;
         index.code_actions_for_text_range(&path, &text, uri, Some(params.range))
     }
 
@@ -269,15 +271,26 @@ impl Server {
         text: &str,
         input: &mut R,
         output: &mut W,
+        allow_query: bool,
     ) -> Result<()> {
-        if !self.ty_bridge {
+        index.apply_external_annotations(&self.ty_annotations);
+        if !allow_query || !self.ty_bridge {
             return Ok(());
         }
-        let queries = index.external_type_queries_for_text(file, text);
+        let queries: Vec<_> = index
+            .external_type_queries_for_text(file, text)
+            .into_iter()
+            .filter(|query| {
+                !self
+                    .ty_annotations
+                    .contains_key(&(normalize_path(&query.path), query.name.clone()))
+            })
+            .collect();
         if queries.is_empty() {
             return Ok(());
         }
         let annotations = self.request_fixture_return_types(queries, input, output)?;
+        self.ty_annotations.extend(annotations.clone());
         index.apply_external_annotations(&annotations);
         Ok(())
     }
