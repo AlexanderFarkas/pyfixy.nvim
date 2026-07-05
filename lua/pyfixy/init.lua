@@ -66,14 +66,97 @@ local function start(bufnr, ty)
     root_dir = root,
     filetypes = { "python" },
     single_file_support = false,
+    handlers = {
+      ["pyfixy/fixtureReturnTypes"] = handle_fixture_return_types,
+    },
     init_options = {
       diagnostics = config.diagnostics,
+      ty_bridge = true,
     },
   }, { bufnr = bufnr })
 
   if id then
     started_by_root[root] = id
   end
+end
+
+local function extract_hover_type(value, fixture_name)
+  if type(value) ~= "string" then
+    return nil
+  end
+  local patterns = {
+    "def%s+" .. vim.pesc(fixture_name) .. "%b()%s*%-%>%s*([^:\n`]+)",
+    "%)%s*%-%>%s*([^:\n`]+)",
+  }
+  for _, pattern in ipairs(patterns) do
+    local ty = value:match(pattern)
+    if ty then
+      ty = vim.trim(ty)
+      if ty ~= "" and ty ~= "Unknown" then
+        return ty
+      end
+    end
+  end
+end
+
+local function hover_type_from_result(result, fixture_name)
+  if not result or not result.contents then
+    return nil
+  end
+  local contents = result.contents
+  if type(contents) == "string" then
+    return extract_hover_type(contents, fixture_name)
+  end
+  if contents.value then
+    return extract_hover_type(contents.value, fixture_name)
+  end
+  if vim.islist(contents) then
+    for _, item in ipairs(contents) do
+      local text = type(item) == "string" and item or item.value
+      local ty = extract_hover_type(text, fixture_name)
+      if ty then
+        return ty
+      end
+    end
+  end
+end
+
+local function handle_fixture_return_types(_err, params, ctx)
+  local pyfixy = vim.lsp.get_client_by_id(ctx.client_id)
+  local root = pyfixy and root_for(pyfixy)
+  local results = {}
+  for _, fixture in ipairs(params.fixtures or {}) do
+    local path = vim.uri_to_fname(fixture.uri)
+    local bufnr = vim.fn.bufadd(path)
+    vim.fn.bufload(bufnr)
+    local ty_client
+    for _, client in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
+      if is_ty(client) and (not root or root_for(client) == root) then
+        ty_client = client
+        break
+      end
+    end
+    if not ty_client and root then
+      for _, client in ipairs(vim.lsp.get_clients()) do
+        if is_ty(client) and root_for(client) == root then
+          vim.lsp.buf_attach_client(bufnr, client.id)
+          ty_client = client
+          break
+        end
+      end
+    end
+    if ty_client then
+      local response = ty_client:request_sync("textDocument/hover", {
+        textDocument = { uri = fixture.uri },
+        position = fixture.position,
+      }, 800, bufnr)
+      local ty = response and not response.err and hover_type_from_result(response.result, fixture.name)
+      if ty then
+        table.insert(results, { uri = fixture.uri, name = fixture.name, type = ty })
+      end
+    end
+  end
+  return results
 end
 
 local function maybe_start(bufnr)

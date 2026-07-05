@@ -58,6 +58,13 @@ pub struct DiagnosticConfig {
     pub mismatched_annotation: DiagnosticSeverity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixtureTypeQuery {
+    pub name: String,
+    pub path: PathBuf,
+    pub position: Position,
+}
+
 impl Default for DiagnosticConfig {
     fn default() -> Self {
         Self {
@@ -140,6 +147,34 @@ impl FixtureIndex {
             uri: Url::from_file_path(&fixture.path).unwrap(),
             range: fixture.range,
         }))
+    }
+
+    pub fn external_type_queries_for_text(&self, file: &Path, text: &str) -> Vec<FixtureTypeQuery> {
+        let file = normalize_path(file);
+        self.visible_fixtures_for_text(&file, text)
+            .into_iter()
+            .filter(|fixture| fixture.return_annotation.is_none())
+            .map(|fixture| FixtureTypeQuery {
+                name: fixture.name.clone(),
+                path: fixture.path.clone(),
+                position: fixture.name_range.start,
+            })
+            .collect()
+    }
+
+    pub fn apply_external_annotations(&mut self, annotations: &HashMap<(PathBuf, String), String>) {
+        for fixture in &mut self.fixtures {
+            if fixture.return_annotation.is_some() {
+                continue;
+            }
+            let key = (normalize_path(&fixture.path), fixture.name.clone());
+            if let Some(text) = annotations.get(&key).filter(|text| !text.trim().is_empty()) {
+                fixture.return_annotation = Some(FixtureAnnotation {
+                    text: text.trim().to_string(),
+                    imports: Vec::new(),
+                });
+            }
+        }
     }
 
     pub fn diagnostics_for_text(
@@ -226,6 +261,16 @@ impl FixtureIndex {
         text: &str,
         uri: Url,
     ) -> Result<Vec<CodeAction>> {
+        self.code_actions_for_text_range(file, text, uri, None)
+    }
+
+    pub fn code_actions_for_text_range(
+        &self,
+        file: &Path,
+        text: &str,
+        uri: Url,
+        requested_range: Option<Range>,
+    ) -> Result<Vec<CodeAction>> {
         let file = normalize_path(file);
         let diagnostics = self.annotation_diagnostics_for_text(&file, text)?;
         let visible: HashMap<String, &Fixture> = self
@@ -234,7 +279,11 @@ impl FixtureIndex {
             .map(|fixture| (fixture.name.clone(), fixture))
             .collect();
         let mut actions = Vec::new();
-        for d in &diagnostics {
+        for d in diagnostics.iter().filter(|d| {
+            requested_range
+                .map(|range| ranges_intersect_or_touch_cursor(d.range, range))
+                .unwrap_or(true)
+        }) {
             let Some(fixture) = visible.get(&d.fixture_name) else {
                 continue;
             };
@@ -242,7 +291,7 @@ impl FixtureIndex {
             actions.push(CodeAction {
                 title: "Add fixture type annotation".into(),
                 kind: Some(CodeActionKind::QUICKFIX),
-                edit: Some(workspace_edit(uri.clone(), edits)),
+                edit: Some(workspace_edit(uri.clone(), coalesce_text_edits(edits))),
                 ..Default::default()
             });
         }
@@ -256,7 +305,7 @@ impl FixtureIndex {
             actions.push(CodeAction {
                 title: "Add fixture type annotations in file".into(),
                 kind: Some(CodeActionKind::SOURCE),
-                edit: Some(workspace_edit(uri, dedupe_text_edits(edits))),
+                edit: Some(workspace_edit(uri, coalesce_text_edits(edits))),
                 ..Default::default()
             });
         }
@@ -1406,6 +1455,112 @@ def test_two(db: str): pass
     }
 
     #[test]
+    fn code_actions_filter_to_requested_parameter_range() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+@pytest.fixture
+def admin_client() -> TestClient: pass
+@pytest.fixture
+def root_client() -> RootClient: pass
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "def test_user(admin_client, root_client): pass
+";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let actions = index
+            .code_actions_for_text_range(
+                &test,
+                text,
+                file_url(&test),
+                Some(Range {
+                    start: Position {
+                        line: 0,
+                        character: 14,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 14,
+                    },
+                }),
+            )
+            .unwrap();
+        let quickfixes: Vec<_> = actions
+            .iter()
+            .filter(|action| action.title == "Add fixture type annotation")
+            .collect();
+        assert_eq!(quickfixes.len(), 1);
+        let edits = quickfixes[0]
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        assert!(edits.iter().any(|edit| edit.new_text == ": TestClient"));
+        assert!(!edits.iter().any(|edit| edit.new_text == ": RootClient"));
+    }
+
+    #[test]
+    fn whole_file_action_coalesces_multiple_imports_at_same_position() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+from app.clients import AdminClient
+from app.clients import RootClient
+@pytest.fixture
+def admin_client() -> AdminClient: pass
+@pytest.fixture
+def root_client() -> RootClient: pass
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "def test_user(admin_client, root_client): pass
+";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let actions = index
+            .code_actions_for_text_range(&test, text, file_url(&test), None)
+            .unwrap();
+        let file_action = actions
+            .iter()
+            .find(|action| action.title == "Add fixture type annotations in file")
+            .unwrap();
+        let edits = file_action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        let import_edits: Vec<_> = edits
+            .iter()
+            .filter(|edit| {
+                edit.range.start.line == 0
+                    && edit.range.start.character == 0
+                    && edit.range.start == edit.range.end
+            })
+            .collect();
+        assert_eq!(import_edits.len(), 1);
+        assert!(import_edits[0]
+            .new_text
+            .contains("from app.clients import AdminClient\n"));
+        assert!(import_edits[0]
+            .new_text
+            .contains("from app.clients import RootClient\n"));
+    }
+
+    #[test]
     fn code_actions_add_import_and_replace_or_insert_annotation() {
         let tmp = TempDir::new().unwrap();
         write(
@@ -1819,9 +1974,9 @@ fn edits_for_annotation(
     edits
 }
 
-fn dedupe_text_edits(edits: Vec<TextEdit>) -> Vec<TextEdit> {
-    let mut seen = HashSet::new();
-    let mut result = Vec::new();
+fn coalesce_text_edits(edits: Vec<TextEdit>) -> Vec<TextEdit> {
+    let mut seen_exact = HashSet::new();
+    let mut result: Vec<TextEdit> = Vec::new();
     for edit in edits {
         let key = (
             edit.range.start.line,
@@ -1830,11 +1985,32 @@ fn dedupe_text_edits(edits: Vec<TextEdit>) -> Vec<TextEdit> {
             edit.range.end.character,
             edit.new_text.clone(),
         );
-        if seen.insert(key) {
-            result.push(edit);
+        if !seen_exact.insert(key) {
+            continue;
         }
+        if edit.range.start == edit.range.end {
+            if let Some(existing) = result
+                .iter_mut()
+                .find(|existing| existing.range == edit.range)
+            {
+                existing.new_text.push_str(&edit.new_text);
+                continue;
+            }
+        }
+        result.push(edit);
     }
     result
+}
+
+fn ranges_intersect_or_touch_cursor(diagnostic: Range, requested: Range) -> bool {
+    if requested.start == requested.end {
+        return position_in_range(requested.start, diagnostic);
+    }
+    position_le(diagnostic.start, requested.end) && position_le(requested.start, diagnostic.end)
+}
+
+fn position_le(left: Position, right: Position) -> bool {
+    left.line < right.line || left.line == right.line && left.character <= right.character
 }
 
 fn workspace_edit(uri: Url, edits: Vec<TextEdit>) -> WorkspaceEdit {

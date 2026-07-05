@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use lsp_types::*;
-use pyfixy_lsp::{DiagnosticConfig, FixtureIndex};
+use pyfixy_lsp::{DiagnosticConfig, FixtureIndex, FixtureTypeQuery};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -17,6 +17,8 @@ struct Server {
     root: Option<PathBuf>,
     documents: HashMap<PathBuf, String>,
     diagnostics: DiagnosticConfig,
+    next_client_request_id: u64,
+    ty_bridge: bool,
 }
 
 impl Default for Server {
@@ -25,6 +27,8 @@ impl Default for Server {
             root: None,
             documents: HashMap::new(),
             diagnostics: DiagnosticConfig::default(),
+            next_client_request_id: 1_000_000,
+            ty_bridge: false,
         }
     }
 }
@@ -45,7 +49,8 @@ impl Server {
                     (Some(id), "initialize") => {
                         let init_params = v.get("params").cloned().unwrap_or_default();
                         self.root = root_from_initialize(init_params.clone());
-                        self.diagnostics = diagnostics_from_initialize(init_params);
+                        self.diagnostics = diagnostics_from_initialize(init_params.clone());
+                        self.ty_bridge = ty_bridge_from_initialize(init_params);
                         send(
                             &mut output,
                             json!({"jsonrpc":"2.0","id":id,"result": InitializeResult {
@@ -62,8 +67,11 @@ impl Server {
                         )?;
                     }
                     (Some(id), "textDocument/completion") => {
-                        let result =
-                            self.handle_completion(v.get("params").cloned().unwrap_or_default())?;
+                        let result = self.handle_completion(
+                            v.get("params").cloned().unwrap_or_default(),
+                            &mut input,
+                            &mut output,
+                        )?;
                         send(
                             &mut output,
                             json!({"jsonrpc":"2.0","id":id,"result":result}),
@@ -86,8 +94,11 @@ impl Server {
                         )?;
                     }
                     (Some(id), "textDocument/codeAction") => {
-                        let result =
-                            self.handle_code_action(v.get("params").cloned().unwrap_or_default())?;
+                        let result = self.handle_code_action(
+                            v.get("params").cloned().unwrap_or_default(),
+                            &mut input,
+                            &mut output,
+                        )?;
                         send(
                             &mut output,
                             json!({"jsonrpc":"2.0","id":id,"result":result}),
@@ -141,7 +152,12 @@ impl Server {
         FixtureIndex::build(self.root.as_ref().context("not initialized")?)
     }
 
-    fn handle_completion(&self, params: Value) -> Result<Vec<CompletionItem>> {
+    fn handle_completion<R: BufRead, W: Write>(
+        &mut self,
+        params: Value,
+        input: &mut R,
+        output: &mut W,
+    ) -> Result<Vec<CompletionItem>> {
         let params: CompletionParams = serde_json::from_value(params)?;
         let path = params
             .text_document_position
@@ -149,10 +165,11 @@ impl Server {
             .uri
             .to_file_path()
             .unwrap();
-        let index = self.index()?;
+        let mut index = self.index()?;
         let path = normalize_path(&path);
-        if let Some(text) = self.documents.get(&path) {
-            index.completions_for_text(&path, text, params.text_document_position.position)
+        if let Some(text) = self.documents.get(&path).cloned() {
+            self.enrich_index_with_ty(&mut index, &path, &text, input, output)?;
+            index.completions_for_text(&path, &text, params.text_document_position.position)
         } else {
             index.completions(&path, params.text_document_position.position)
         }
@@ -226,7 +243,12 @@ impl Server {
             .references(&path, params.text_document_position.position)
     }
 
-    fn handle_code_action(&self, params: Value) -> Result<Vec<CodeAction>> {
+    fn handle_code_action<R: BufRead, W: Write>(
+        &mut self,
+        params: Value,
+        input: &mut R,
+        output: &mut W,
+    ) -> Result<Vec<CodeAction>> {
         let params: CodeActionParams = serde_json::from_value(params)?;
         let uri = params.text_document.uri;
         let path = normalize_path(&uri.to_file_path().unwrap());
@@ -235,8 +257,94 @@ impl Server {
             .get(&path)
             .cloned()
             .unwrap_or_else(|| std::fs::read_to_string(&path).unwrap_or_default());
-        self.index()?.code_actions_for_text(&path, &text, uri)
+        let mut index = self.index()?;
+        self.enrich_index_with_ty(&mut index, &path, &text, input, output)?;
+        index.code_actions_for_text_range(&path, &text, uri, Some(params.range))
     }
+
+    fn enrich_index_with_ty<R: BufRead, W: Write>(
+        &mut self,
+        index: &mut FixtureIndex,
+        file: &std::path::Path,
+        text: &str,
+        input: &mut R,
+        output: &mut W,
+    ) -> Result<()> {
+        if !self.ty_bridge {
+            return Ok(());
+        }
+        let queries = index.external_type_queries_for_text(file, text);
+        if queries.is_empty() {
+            return Ok(());
+        }
+        let annotations = self.request_fixture_return_types(queries, input, output)?;
+        index.apply_external_annotations(&annotations);
+        Ok(())
+    }
+
+    fn request_fixture_return_types<R: BufRead, W: Write>(
+        &mut self,
+        queries: Vec<FixtureTypeQuery>,
+        input: &mut R,
+        output: &mut W,
+    ) -> Result<HashMap<(PathBuf, String), String>> {
+        let id = self.next_client_request_id;
+        self.next_client_request_id += 1;
+        let fixtures: Vec<_> = queries
+            .iter()
+            .map(|query| {
+                json!({
+                    "name": query.name,
+                    "uri": Url::from_file_path(&query.path).unwrap(),
+                    "position": query.position,
+                })
+            })
+            .collect();
+        send(
+            output,
+            json!({"jsonrpc":"2.0","id":id,"method":"pyfixy/fixtureReturnTypes","params":{"fixtures":fixtures}}),
+        )?;
+
+        loop {
+            let Some(message) = read_message(input)? else {
+                return Ok(HashMap::new());
+            };
+            let value: Value = serde_json::from_str(&message)?;
+            if value.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            let mut result = HashMap::new();
+            if let Some(items) = value.get("result").and_then(Value::as_array) {
+                for item in items {
+                    let Some(name) = item.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(ty) = item.get("type").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(uri) = item.get("uri").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Ok(uri) = Url::parse(uri) else {
+                        continue;
+                    };
+                    let Ok(path) = uri.to_file_path() else {
+                        continue;
+                    };
+                    result.insert((normalize_path(&path), name.to_string()), ty.to_string());
+                }
+            }
+            return Ok(result);
+        }
+    }
+}
+
+fn ty_bridge_from_initialize(params: Value) -> bool {
+    params
+        .get("initializationOptions")
+        .and_then(|v| v.get("ty_bridge"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn diagnostics_from_initialize(params: Value) -> DiagnosticConfig {
