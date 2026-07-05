@@ -246,6 +246,72 @@ fn publishes_fixture_annotation_diagnostics_with_configured_severity() {
 }
 
 #[test]
+fn code_action_only_quickfix_excludes_whole_file_source_action() {
+    let tmp = TempDir::new().unwrap();
+    let conftest = tmp.path().join("tests/conftest.py");
+    let test = tmp.path().join("tests/test_app.py");
+    write(
+        &conftest,
+        "import pytest\n@pytest.fixture\ndef user() -> User: pass\n",
+    );
+    write(&test, "def test_user(user): pass\n");
+
+    let mut lsp = Lsp::start();
+    lsp.request(
+        "initialize",
+        json!({ "rootUri": url::Url::from_directory_path(tmp.path()).unwrap() }),
+    );
+    let response = lsp.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": { "uri": url::Url::from_file_path(&test).unwrap() },
+            "range": { "start": { "line": 0, "character": 15 }, "end": { "line": 0, "character": 15 } },
+            "context": { "diagnostics": [], "only": ["quickfix"] }
+        }),
+    );
+    let actions = response["result"].as_array().unwrap();
+    assert!(actions
+        .iter()
+        .any(|a| a["title"] == "Add fixture type annotation"));
+    assert!(!actions
+        .iter()
+        .any(|a| a["title"] == "Add fixture type annotations in file"));
+}
+
+#[test]
+fn code_action_only_source_excludes_parameter_quickfixes() {
+    let tmp = TempDir::new().unwrap();
+    let conftest = tmp.path().join("tests/conftest.py");
+    let test = tmp.path().join("tests/test_app.py");
+    write(
+        &conftest,
+        "import pytest\n@pytest.fixture\ndef user() -> User: pass\n",
+    );
+    write(&test, "def test_user(user): pass\n");
+
+    let mut lsp = Lsp::start();
+    lsp.request(
+        "initialize",
+        json!({ "rootUri": url::Url::from_directory_path(tmp.path()).unwrap() }),
+    );
+    let response = lsp.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": { "uri": url::Url::from_file_path(&test).unwrap() },
+            "range": { "start": { "line": 0, "character": 15 }, "end": { "line": 0, "character": 15 } },
+            "context": { "diagnostics": [], "only": ["source"] }
+        }),
+    );
+    let actions = response["result"].as_array().unwrap();
+    assert!(actions
+        .iter()
+        .any(|a| a["title"] == "Add fixture type annotations in file"));
+    assert!(!actions
+        .iter()
+        .any(|a| a["title"] == "Add fixture type annotation"));
+}
+
+#[test]
 fn code_action_returns_fixture_annotation_edits_over_stdio() {
     let tmp = TempDir::new().unwrap();
     let conftest = tmp.path().join("tests/conftest.py");

@@ -35,6 +35,7 @@ pub struct FixtureAnnotation {
 pub struct ImportRequirement {
     pub module: String,
     pub name: String,
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,10 +110,14 @@ impl FixtureIndex {
                     ..Default::default()
                 };
                 if let Some(annotation) = &f.return_annotation {
-                    item.insert_text = Some(format!("{}: {}", f.name, annotation.text));
-                    let edits = import_text_edits(text, annotation);
-                    if !edits.is_empty() {
-                        item.additional_text_edits = Some(edits);
+                    if is_in_parameter_annotation_context(text, position) {
+                        item.insert_text = Some(f.name.clone());
+                    } else {
+                        item.insert_text = Some(format!("{}: {}", f.name, annotation.text));
+                        let edits = import_text_edits(text, annotation);
+                        if !edits.is_empty() {
+                            item.additional_text_edits = Some(edits);
+                        }
                     }
                 }
                 item
@@ -793,6 +798,24 @@ fn position_in_range(position: Position, range: Range) -> bool {
             || position.line == range.end.line && position.character <= range.end.character)
 }
 
+fn is_in_parameter_annotation_context(text: &str, position: Position) -> bool {
+    let offset = position_to_byte(text, position).min(text.len());
+    let Some(before) = text.get(..offset) else {
+        return false;
+    };
+    let Some(def_pos) = before.rfind("def ") else {
+        return false;
+    };
+    let header = &before[def_pos..];
+    let Some(open) = header.find('(') else {
+        return false;
+    };
+    let params = &header[open + 1..];
+    let colon = params.rfind(':');
+    let comma = params.rfind(',');
+    colon.is_some_and(|colon| comma.is_none_or(|comma| colon > comma))
+}
+
 fn is_in_function_params(text: &str, position: Position) -> bool {
     let Ok(parsed) = parse_module(text) else {
         return false;
@@ -1392,7 +1415,8 @@ def admin_client() -> TestClient: pass
             ann.imports,
             vec![ImportRequirement {
                 module: "starlette.testclient".into(),
-                name: "TestClient".into()
+                name: "TestClient".into(),
+                alias: None,
             }]
         );
     }
@@ -1590,6 +1614,48 @@ def factory() -> Callable[[Optional[SomeType]], AnotherType]: pass
     }
 
     #[test]
+    fn local_fixture_return_type_is_imported_from_fixture_module() {
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join("tests/__init__.py"), "");
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+
+class LocalClient: pass
+
+@pytest.fixture
+def local_client() -> LocalClient: pass
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "def test_local(local_client): pass
+";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let actions = index
+            .code_actions_for_text_range(&test, text, file_url(&test), None)
+            .unwrap();
+        let quickfix = actions
+            .iter()
+            .find(|action| action.title == "Add fixture type annotation")
+            .unwrap();
+        let edits = quickfix
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        assert!(edits
+            .iter()
+            .any(|edit| edit.new_text == "from tests.conftest import LocalClient\n"));
+        assert!(edits.iter().any(|edit| edit.new_text == ": LocalClient"));
+    }
+
+    #[test]
     fn imports_are_inserted_after_multiline_import_block() {
         let tmp = TempDir::new().unwrap();
         write(
@@ -1628,6 +1694,194 @@ def client() -> TestClient: pass
             .unwrap();
         assert_eq!(import_edit.range.start.line, 3);
         assert_eq!(import_edit.range.start.character, 0);
+    }
+
+    #[test]
+    fn aliased_fixture_annotation_preserves_existing_alias_import() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+from app.models import User as ModelUser
+
+@pytest.fixture
+def user() -> ModelUser: pass
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "def test_user(user): pass
+";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let actions = index
+            .code_actions_for_text_range(&test, text, file_url(&test), None)
+            .unwrap();
+        let quickfix = actions
+            .iter()
+            .find(|action| action.title == "Add fixture type annotation")
+            .unwrap();
+        let edits = quickfix
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        assert!(edits
+            .iter()
+            .any(|edit| edit.new_text == "from app.models import User as ModelUser\n"));
+        assert!(edits.iter().any(|edit| edit.new_text == ": ModelUser"));
+    }
+
+    #[test]
+    fn imports_are_inserted_after_module_docstring_and_future_imports() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+from fastapi.testclient import TestClient
+
+@pytest.fixture
+def client() -> TestClient: pass
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "\"\"\"module docs\"\"\"\nfrom __future__ import annotations\n\ndef test_client(client): pass\n";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let actions = index
+            .code_actions_for_text_range(&test, text, file_url(&test), None)
+            .unwrap();
+        let quickfix = actions
+            .iter()
+            .find(|action| action.title == "Add fixture type annotation")
+            .unwrap();
+        let edits = quickfix
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        let import_edit = edits
+            .iter()
+            .find(|edit| edit.new_text == "from fastapi.testclient import TestClient\n")
+            .unwrap();
+        assert_eq!(import_edit.range.start.line, 2);
+        assert_eq!(import_edit.range.start.character, 0);
+    }
+
+    #[test]
+    fn imports_merge_into_existing_single_line_from_import() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+from app.models import User
+
+@pytest.fixture
+def user() -> User: pass
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "from app.models import Existing\n\ndef test_user(user): pass\n";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let actions = index
+            .code_actions_for_text_range(&test, text, file_url(&test), None)
+            .unwrap();
+        let quickfix = actions
+            .iter()
+            .find(|action| action.title == "Add fixture type annotation")
+            .unwrap();
+        let edits = quickfix
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        assert!(edits.iter().any(|edit| edit.new_text == ", User"));
+        assert!(!edits
+            .iter()
+            .any(|edit| edit.new_text == "from app.models import User\n"));
+    }
+
+    #[test]
+    fn imports_merge_into_existing_multiline_from_import() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+from app.models import User
+
+@pytest.fixture
+def user() -> User: pass
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "from app.models import (\n    Existing,\n)\n\ndef test_user(user): pass\n";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let actions = index
+            .code_actions_for_text_range(&test, text, file_url(&test), None)
+            .unwrap();
+        let quickfix = actions
+            .iter()
+            .find(|action| action.title == "Add fixture type annotation")
+            .unwrap();
+        let edits = quickfix
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        assert!(edits.iter().any(|edit| edit.new_text == "    User,\n"));
+        assert!(!edits
+            .iter()
+            .any(|edit| edit.new_text == "from app.models import User\n"));
+    }
+
+    #[test]
+    fn completion_does_not_insert_annotation_inside_existing_annotation_context() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+@pytest.fixture
+def user() -> User: pass
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "def test_user(user: Us): pass\n";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let items = index
+            .completions_for_text(
+                &test,
+                text,
+                Position {
+                    line: 0,
+                    character: 22,
+                },
+            )
+            .unwrap();
+        let item = items.iter().find(|item| item.label == "user").unwrap();
+        assert_eq!(item.insert_text.as_deref(), Some("user"));
+        assert!(item.additional_text_edits.is_none());
     }
 
     #[test]
@@ -1822,11 +2076,17 @@ fn imports_for_annotation(path: &Path, text: &str, annotation: &str) -> Vec<Impo
                 result.push(ImportRequirement {
                     module,
                     name: symbol,
+                    alias: None,
                 });
             }
         }
     }
-    result.sort_by(|a, b| a.module.cmp(&b.module).then(a.name.cmp(&b.name)));
+    result.sort_by(|a, b| {
+        a.module
+            .cmp(&b.module)
+            .then(a.name.cmp(&b.name))
+            .then(a.alias.cmp(&b.alias))
+    });
     result.dedup();
     result
 }
@@ -1854,6 +2114,7 @@ fn import_resolution_map(path: &Path, text: &str) -> HashMap<String, ImportRequi
                         ImportRequirement {
                             module,
                             name: String::new(),
+                            alias: alias.asname.as_ref().map(|a| a.as_str().to_string()),
                         },
                     );
                 }
@@ -1882,6 +2143,7 @@ fn import_resolution_map(path: &Path, text: &str) -> HashMap<String, ImportRequi
                         ImportRequirement {
                             module: module.clone(),
                             name: alias.name.as_str().to_string(),
+                            alias: alias.asname.as_ref().map(|a| a.as_str().to_string()),
                         },
                     );
                 }
@@ -1977,11 +2239,21 @@ fn import_text_edits(text: &str, annotation: &FixtureAnnotation) -> Vec<TextEdit
         if import_exists(text, req) {
             continue;
         }
+        if let Some(edit) = edit_existing_from_import(text, req) {
+            edits.push(edit);
+            continue;
+        }
         let line = import_insert_line(text);
         let new_text = if req.name.is_empty() {
-            format!("import {}\n", req.module)
+            match &req.alias {
+                Some(alias) => format!("import {} as {}\n", req.module, alias),
+                None => format!("import {}\n", req.module),
+            }
         } else {
-            format!("from {} import {}\n", req.module, req.name)
+            match &req.alias {
+                Some(alias) => format!("from {} import {} as {}\n", req.module, req.name, alias),
+                None => format!("from {} import {}\n", req.module, req.name),
+            }
         };
         edits.push(TextEdit {
             range: Range {
@@ -1996,31 +2268,136 @@ fn import_text_edits(text: &str, annotation: &FixtureAnnotation) -> Vec<TextEdit
 
 fn import_exists(text: &str, req: &ImportRequirement) -> bool {
     if req.name.is_empty() {
-        text.lines()
-            .any(|l| l.trim() == format!("import {}", req.module))
+        match &req.alias {
+            Some(alias) => text
+                .lines()
+                .any(|l| l.trim() == format!("import {} as {}", req.module, alias)),
+            None => text
+                .lines()
+                .any(|l| l.trim() == format!("import {}", req.module)),
+        }
     } else {
-        text.lines()
-            .any(|l| l.trim() == format!("from {} import {}", req.module, req.name))
+        import_name_exists(text, &req.module, &req.name, req.alias.as_deref())
     }
+}
+
+fn import_name_exists(text: &str, module: &str, name: &str, alias: Option<&str>) -> bool {
+    let Ok(parsed) = parse_module(text) else {
+        return false;
+    };
+    if parsed.has_invalid_syntax() {
+        return false;
+    }
+    parsed.syntax().body.iter().any(|stmt| {
+        let Stmt::ImportFrom(import_from) = stmt else {
+            return false;
+        };
+        import_from.level == 0
+            && import_from
+                .module
+                .as_ref()
+                .is_some_and(|m| m.as_str() == module)
+            && import_from.names.iter().any(|candidate| {
+                candidate.name.as_str() == name
+                    && candidate.asname.as_ref().map(|a| a.as_str()) == alias
+            })
+    })
+}
+
+fn edit_existing_from_import(text: &str, req: &ImportRequirement) -> Option<TextEdit> {
+    if req.name.is_empty() {
+        return None;
+    }
+    let parsed = parse_module(text).ok()?;
+    if parsed.has_invalid_syntax() {
+        return None;
+    }
+    for stmt in &parsed.syntax().body {
+        let Stmt::ImportFrom(import_from) = stmt else {
+            continue;
+        };
+        if import_from.level != 0
+            || !import_from
+                .module
+                .as_ref()
+                .is_some_and(|module| module.as_str() == req.module)
+            || import_from
+                .names
+                .iter()
+                .any(|alias| alias.name.as_str() == "*")
+        {
+            continue;
+        }
+        let source = source_for_range(text, stmt.range())?;
+        if req.alias.is_some()
+            || import_from
+                .names
+                .iter()
+                .any(|alias| alias.name.as_str() == req.name)
+        {
+            return None;
+        }
+        if source.contains('(') {
+            let start_byte = u32::from(stmt.range().start()) as usize;
+            let close_rel = source.rfind(')')?;
+            let line_indent = source
+                .lines()
+                .rev()
+                .find(|line| line.trim_end().ends_with(')'))
+                .map(|line| {
+                    line.chars()
+                        .take_while(|ch| ch.is_whitespace())
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            let item_indent = source
+                .lines()
+                .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with("from "))
+                .map(|line| {
+                    line.chars()
+                        .take_while(|ch| ch.is_whitespace())
+                        .collect::<String>()
+                })
+                .unwrap_or_else(|| format!("{}    ", line_indent));
+            let pos = byte_to_position(text, TextSize::new((start_byte + close_rel) as u32));
+            return Some(TextEdit {
+                range: Range {
+                    start: pos,
+                    end: pos,
+                },
+                new_text: format!("{}{},\n", item_indent, req.name),
+            });
+        }
+        let end = range_for_text_range(text, stmt.range()).end;
+        return Some(TextEdit {
+            range: Range { start: end, end },
+            new_text: format!(", {}", req.name),
+        });
+    }
+    None
 }
 
 fn import_insert_line(text: &str) -> u32 {
     if let Ok(parsed) = parse_module(text) {
         if !parsed.has_invalid_syntax() {
             let mut line = 0;
-            for stmt in &parsed.syntax().body {
-                if matches!(stmt, Stmt::Import(_) | Stmt::ImportFrom(_)) {
+            for (idx, stmt) in parsed.syntax().body.iter().enumerate() {
+                let source = source_for_range(text, stmt.range()).unwrap_or_default();
+                if idx == 0 && looks_like_string_literal_stmt(source) {
                     let end = range_for_text_range(text, stmt.range()).end;
                     line = if end.character == 0 {
                         end.line
                     } else {
                         end.line + 1
                     };
-                } else if !source_for_range(text, stmt.range())
-                    .unwrap_or_default()
-                    .trim()
-                    .is_empty()
-                {
+                } else if matches!(stmt, Stmt::Import(_) | Stmt::ImportFrom(_)) {
+                    let end = range_for_text_range(text, stmt.range()).end;
+                    line = if end.character == 0 {
+                        end.line
+                    } else {
+                        end.line + 1
+                    };
+                } else if !source.trim().is_empty() {
                     break;
                 }
             }
@@ -2048,6 +2425,16 @@ fn import_insert_line(text: &str) -> u32 {
         }
     }
     last
+}
+
+fn looks_like_string_literal_stmt(source: &str) -> bool {
+    let trimmed = source.trim_start();
+    trimmed.starts_with('"')
+        || trimmed.starts_with('\'')
+        || trimmed.starts_with("r\"")
+        || trimmed.starts_with("r'")
+        || trimmed.starts_with("R\"")
+        || trimmed.starts_with("R'")
 }
 
 fn edits_for_annotation(

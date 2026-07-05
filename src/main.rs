@@ -235,9 +235,29 @@ impl Server {
             .get(&path)
             .cloned()
             .unwrap_or_else(|| std::fs::read_to_string(&path).unwrap_or_default());
-        self.index()?
-            .code_actions_for_text_range(&path, &text, uri, Some(params.range))
+        let actions =
+            self.index()?
+                .code_actions_for_text_range(&path, &text, uri, Some(params.range))?;
+        Ok(filter_code_actions_by_only(actions, params.context.only))
     }
+}
+
+fn filter_code_actions_by_only(
+    actions: Vec<CodeAction>,
+    only: Option<Vec<CodeActionKind>>,
+) -> Vec<CodeAction> {
+    let Some(only) = only else {
+        return actions;
+    };
+    actions
+        .into_iter()
+        .filter(|action| {
+            action.kind.as_ref().is_some_and(|kind| {
+                only.iter()
+                    .any(|requested| kind.as_str().starts_with(requested.as_str()))
+            })
+        })
+        .collect()
 }
 
 fn diagnostics_from_initialize(params: Value) -> DiagnosticConfig {
