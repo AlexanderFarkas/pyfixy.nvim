@@ -75,18 +75,17 @@ pub struct FixtureIndex {
 
 impl FixtureIndex {
     pub fn build(root: &Path) -> Result<Self> {
+        let root = normalize_path(root);
         let mut fixtures = Vec::new();
-        collect_fixtures(root, root, &mut fixtures)?;
-        expand_conftest_reexports(root, &mut fixtures)?;
-        Ok(Self {
-            root: root.to_path_buf(),
-            fixtures,
-        })
+        collect_fixtures(&root, &root, &mut fixtures)?;
+        expand_conftest_reexports(&root, &mut fixtures)?;
+        Ok(Self { root, fixtures })
     }
 
     pub fn completions(&self, file: &Path, position: Position) -> Result<Vec<CompletionItem>> {
-        let text = fs::read_to_string(file)?;
-        self.completions_for_text(file, &text, position)
+        let file = normalize_path(file);
+        let text = fs::read_to_string(&file)?;
+        self.completions_for_text(&file, &text, position)
     }
 
     pub fn completions_for_text(
@@ -95,11 +94,12 @@ impl FixtureIndex {
         text: &str,
         position: Position,
     ) -> Result<Vec<CompletionItem>> {
+        let file = normalize_path(file);
         if !is_in_function_params(text, position) {
             return Ok(Vec::new());
         }
         Ok(self
-            .visible_fixtures_for_text(file, text)
+            .visible_fixtures_for_text(&file, text)
             .into_iter()
             .map(|f| {
                 let mut item = CompletionItem {
@@ -121,7 +121,8 @@ impl FixtureIndex {
     }
 
     pub fn definition(&self, file: &Path, position: Position) -> Result<Option<Location>> {
-        let text = fs::read_to_string(file)?;
+        let file = normalize_path(file);
+        let text = fs::read_to_string(&file)?;
         let Some(name) = identifier_at_position(&text, position) else {
             return Ok(None);
         };
@@ -129,7 +130,7 @@ impl FixtureIndex {
             return Ok(None);
         }
         let Some(fixture) = self
-            .visible_fixtures(file)
+            .visible_fixtures(&file)
             .into_iter()
             .find(|f| f.name == name)
         else {
@@ -177,8 +178,9 @@ impl FixtureIndex {
         file: &Path,
         text: &str,
     ) -> Result<Vec<FixtureAnnotationDiagnostic>> {
+        let file = normalize_path(file);
         let visible: HashMap<String, &Fixture> = self
-            .visible_fixtures_for_text(file, text)
+            .visible_fixtures_for_text(&file, text)
             .into_iter()
             .map(|fixture| (fixture.name.clone(), fixture))
             .collect();
@@ -199,7 +201,7 @@ impl FixtureIndex {
                         if !annotations_equivalent(
                             &text_annotation,
                             &fixture_annotation.text,
-                            file,
+                            &file,
                             text,
                             fixture,
                         ) =>
@@ -224,9 +226,10 @@ impl FixtureIndex {
         text: &str,
         uri: Url,
     ) -> Result<Vec<CodeAction>> {
-        let diagnostics = self.annotation_diagnostics_for_text(file, text)?;
+        let file = normalize_path(file);
+        let diagnostics = self.annotation_diagnostics_for_text(&file, text)?;
         let visible: HashMap<String, &Fixture> = self
-            .visible_fixtures_for_text(file, text)
+            .visible_fixtures_for_text(&file, text)
             .into_iter()
             .map(|fixture| (fixture.name.clone(), fixture))
             .collect();
@@ -261,7 +264,8 @@ impl FixtureIndex {
     }
 
     pub fn references(&self, file: &Path, position: Position) -> Result<Vec<Location>> {
-        let Some(name) = self.fixture_name_at(file, position)? else {
+        let file = normalize_path(file);
+        let Some(name) = self.fixture_name_at(&file, position)? else {
             return Ok(Vec::new());
         };
 
@@ -294,13 +298,14 @@ impl FixtureIndex {
     }
 
     fn fixture_name_at(&self, file: &Path, position: Position) -> Result<Option<String>> {
-        let text = fs::read_to_string(file)?;
+        let file = normalize_path(file);
+        let text = fs::read_to_string(&file)?;
         if is_in_function_params(&text, position) {
             let Some(name) = identifier_at_position(&text, position) else {
                 return Ok(None);
             };
             return Ok(self
-                .visible_fixtures(file)
+                .visible_fixtures(&file)
                 .into_iter()
                 .any(|fixture| fixture.name == name)
                 .then_some(name));
@@ -314,15 +319,17 @@ impl FixtureIndex {
     }
 
     fn visible_fixtures(&self, file: &Path) -> Vec<&Fixture> {
-        let text = fs::read_to_string(file).unwrap_or_default();
-        self.visible_fixtures_for_text(file, &text)
+        let file = normalize_path(file);
+        let text = fs::read_to_string(&file).unwrap_or_default();
+        self.visible_fixtures_for_text(&file, &text)
     }
 
     fn visible_fixtures_for_text(&self, file: &Path, text: &str) -> Vec<&Fixture> {
+        let file = normalize_path(file);
         let file_dir = file.parent().unwrap_or_else(|| Path::new(""));
         let imports =
-            imported_fixture_sources_from_text(file, text, &self.root).unwrap_or_default();
-        let plugin_modules = pytest_plugin_modules(file).unwrap_or_default();
+            imported_fixture_sources_from_text(&file, text, &self.root).unwrap_or_default();
+        let plugin_modules = pytest_plugin_modules(&file).unwrap_or_default();
         let plugin_paths: HashSet<PathBuf> = plugin_modules
             .iter()
             .filter_map(|module| module_to_path(&self.root, module))
@@ -332,7 +339,7 @@ impl FixtureIndex {
         for fixture in &self.fixtures {
             let Some(score) = fixture_visibility_score(
                 fixture,
-                file,
+                &file,
                 file_dir,
                 &imports,
                 &plugin_paths,
@@ -584,6 +591,10 @@ fn import_specs(file: &Path, root: &Path) -> Result<Vec<ImportSpec>> {
         }
     }
     Ok(specs)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn collect_python_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -897,6 +908,10 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn file_url(path: impl AsRef<Path>) -> Url {
+        Url::from_file_path(normalize_path(path.as_ref())).unwrap()
+    }
+
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
@@ -1140,7 +1155,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(location.uri, Url::from_file_path(nested_conftest).unwrap());
+        assert_eq!(location.uri, file_url(nested_conftest));
     }
 
     #[test]
@@ -1176,7 +1191,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(location.uri, Url::from_file_path(fixture_module).unwrap());
+        assert_eq!(location.uri, file_url(fixture_module));
     }
 
     #[test]
@@ -1203,7 +1218,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(location.uri, Url::from_file_path(helper).unwrap());
+        assert_eq!(location.uri, file_url(helper));
     }
 
     #[test]
@@ -1257,9 +1272,9 @@ mod tests {
             )
             .unwrap();
         let uris: Vec<_> = refs.iter().map(|loc| loc.uri.clone()).collect();
-        assert!(uris.contains(&Url::from_file_path(test_one).unwrap()));
-        assert!(uris.contains(&Url::from_file_path(test_two).unwrap()));
-        assert!(!uris.contains(&Url::from_file_path(sibling).unwrap()));
+        assert!(uris.contains(&file_url(test_one)));
+        assert!(uris.contains(&file_url(test_two)));
+        assert!(!uris.contains(&file_url(sibling)));
     }
 
     #[test]
@@ -1284,8 +1299,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(refs.len(), 2);
-        let test_one_uri = Url::from_file_path(test_one).unwrap();
-        let test_two_uri = Url::from_file_path(test_two).unwrap();
+        let test_one_uri = file_url(test_one);
+        let test_two_uri = file_url(test_two);
         assert!(refs.iter().any(|loc| loc.uri == test_one_uri));
         assert!(refs.iter().any(|loc| loc.uri == test_two_uri));
     }
@@ -1311,8 +1326,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(refs.len(), 2);
-        let conftest_uri = Url::from_file_path(conftest).unwrap();
-        let test_uri = Url::from_file_path(test).unwrap();
+        let conftest_uri = file_url(conftest);
+        let test_uri = file_url(test);
         assert!(refs
             .iter()
             .any(|loc| loc.uri == conftest_uri && loc.range.start.line == 5));
@@ -1340,7 +1355,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(location.uri, Url::from_file_path(conftest).unwrap());
+        assert_eq!(location.uri, file_url(conftest));
     }
 
     #[test]
@@ -1407,7 +1422,7 @@ def user() -> User: pass
         write(&test, text);
         let index = FixtureIndex::build(tmp.path()).unwrap();
         let actions = index
-            .code_actions_for_text(&test, text, Url::from_file_path(&test).unwrap())
+            .code_actions_for_text(&test, text, file_url(&test))
             .unwrap();
         let edits = actions[0]
             .edit

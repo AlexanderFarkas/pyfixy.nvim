@@ -78,6 +78,12 @@ fn write(path: &std::path::Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
+fn file_url_string(path: impl AsRef<std::path::Path>) -> String {
+    url::Url::from_file_path(std::fs::canonicalize(path).unwrap())
+        .unwrap()
+        .to_string()
+}
+
 fn read_until_publish_diagnostics(lsp: &mut Lsp) -> Value {
     loop {
         let msg = lsp.read();
@@ -182,10 +188,7 @@ fn completion_and_definition_work_over_stdio() {
             "position": { "line": 0, "character": 15 }
         }),
     );
-    assert_eq!(
-        definition["result"]["uri"],
-        url::Url::from_file_path(&conftest).unwrap().to_string()
-    );
+    assert_eq!(definition["result"]["uri"], file_url_string(&conftest));
 
     let references = lsp.request(
         "textDocument/references",
@@ -195,7 +198,7 @@ fn completion_and_definition_work_over_stdio() {
             "context": { "includeDeclaration": false }
         }),
     );
-    let test_uri = url::Url::from_file_path(test).unwrap().to_string();
+    let test_uri = file_url_string(test);
     assert!(references["result"]
         .as_array()
         .unwrap()

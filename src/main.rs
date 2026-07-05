@@ -150,6 +150,7 @@ impl Server {
             .to_file_path()
             .unwrap();
         let index = self.index()?;
+        let path = normalize_path(&path);
         if let Some(text) = self.documents.get(&path) {
             index.completions_for_text(&path, text, params.text_document_position.position)
         } else {
@@ -165,6 +166,7 @@ impl Server {
             .uri
             .to_file_path()
             .unwrap();
+        let path = normalize_path(&path);
         Ok(self
             .index()?
             .definition(&path, params.text_document_position_params.position)?
@@ -175,6 +177,7 @@ impl Server {
         let params: DidOpenTextDocumentParams = serde_json::from_value(params)?;
         let uri = params.text_document.uri;
         if let Ok(path) = uri.to_file_path() {
+            let path = normalize_path(&path);
             let text = params.text_document.text;
             let diagnostics = self
                 .index()?
@@ -189,6 +192,7 @@ impl Server {
         let params: DidChangeTextDocumentParams = serde_json::from_value(params)?;
         let uri = params.text_document.uri;
         if let Ok(path) = uri.to_file_path() {
+            let path = normalize_path(&path);
             if let Some(change) = params.content_changes.into_iter().last() {
                 let diagnostics =
                     self.index()?
@@ -203,7 +207,7 @@ impl Server {
     fn handle_did_close(&mut self, params: Value) -> Result<Option<Url>> {
         let params: DidCloseTextDocumentParams = serde_json::from_value(params)?;
         if let Ok(path) = params.text_document.uri.to_file_path() {
-            self.documents.remove(&path);
+            self.documents.remove(&normalize_path(&path));
             return Ok(Some(params.text_document.uri));
         }
         Ok(None)
@@ -217,6 +221,7 @@ impl Server {
             .uri
             .to_file_path()
             .unwrap();
+        let path = normalize_path(&path);
         self.index()?
             .references(&path, params.text_document_position.position)
     }
@@ -224,7 +229,7 @@ impl Server {
     fn handle_code_action(&self, params: Value) -> Result<Vec<CodeAction>> {
         let params: CodeActionParams = serde_json::from_value(params)?;
         let uri = params.text_document.uri;
-        let path = uri.to_file_path().unwrap();
+        let path = normalize_path(&uri.to_file_path().unwrap());
         let text = self
             .documents
             .get(&path)
@@ -264,12 +269,17 @@ fn severity_from_str(value: &str) -> Option<DiagnosticSeverity> {
     }
 }
 
+fn normalize_path(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn root_from_initialize(params: Value) -> Option<PathBuf> {
     params
         .get("rootUri")
         .and_then(Value::as_str)
         .and_then(|uri| Url::parse(uri).ok())
         .and_then(|uri| uri.to_file_path().ok())
+        .map(|path| normalize_path(&path))
 }
 
 fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<String>> {
