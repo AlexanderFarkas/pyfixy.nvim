@@ -1778,7 +1778,7 @@ def client() -> TestClient: pass
     }
 
     #[test]
-    fn imports_merge_into_existing_single_line_from_import() {
+    fn imports_do_not_merge_into_existing_single_line_from_import() {
         let tmp = TempDir::new().unwrap();
         write(
             &tmp.path().join("tests/conftest.py"),
@@ -1810,14 +1810,14 @@ def user() -> User: pass
             .values()
             .next()
             .unwrap();
-        assert!(edits.iter().any(|edit| edit.new_text == ", User"));
-        assert!(!edits
+        assert!(edits
             .iter()
             .any(|edit| edit.new_text == "from app.models import User\n"));
+        assert!(!edits.iter().any(|edit| edit.new_text == ", User"));
     }
 
     #[test]
-    fn imports_merge_into_existing_multiline_from_import() {
+    fn imports_do_not_merge_into_existing_multiline_from_import() {
         let tmp = TempDir::new().unwrap();
         write(
             &tmp.path().join("tests/conftest.py"),
@@ -1849,10 +1849,13 @@ def user() -> User: pass
             .values()
             .next()
             .unwrap();
-        assert!(edits.iter().any(|edit| edit.new_text == "    User,\n"));
-        assert!(!edits
+        let import_edit = edits
             .iter()
-            .any(|edit| edit.new_text == "from app.models import User\n"));
+            .find(|edit| edit.new_text == "from app.models import User\n")
+            .unwrap();
+        assert_eq!(import_edit.range.start.line, 3);
+        assert_eq!(import_edit.range.start.character, 0);
+        assert!(!edits.iter().any(|edit| edit.new_text == "    User,\n"));
     }
 
     #[test]
@@ -2239,10 +2242,6 @@ fn import_text_edits(text: &str, annotation: &FixtureAnnotation) -> Vec<TextEdit
         if import_exists(text, req) {
             continue;
         }
-        if let Some(edit) = edit_existing_from_import(text, req) {
-            edits.push(edit);
-            continue;
-        }
         let line = import_insert_line(text);
         let new_text = if req.name.is_empty() {
             match &req.alias {
@@ -2302,79 +2301,6 @@ fn import_name_exists(text: &str, module: &str, name: &str, alias: Option<&str>)
                     && candidate.asname.as_ref().map(|a| a.as_str()) == alias
             })
     })
-}
-
-fn edit_existing_from_import(text: &str, req: &ImportRequirement) -> Option<TextEdit> {
-    if req.name.is_empty() {
-        return None;
-    }
-    let parsed = parse_module(text).ok()?;
-    if parsed.has_invalid_syntax() {
-        return None;
-    }
-    for stmt in &parsed.syntax().body {
-        let Stmt::ImportFrom(import_from) = stmt else {
-            continue;
-        };
-        if import_from.level != 0
-            || !import_from
-                .module
-                .as_ref()
-                .is_some_and(|module| module.as_str() == req.module)
-            || import_from
-                .names
-                .iter()
-                .any(|alias| alias.name.as_str() == "*")
-        {
-            continue;
-        }
-        let source = source_for_range(text, stmt.range())?;
-        if req.alias.is_some()
-            || import_from
-                .names
-                .iter()
-                .any(|alias| alias.name.as_str() == req.name)
-        {
-            return None;
-        }
-        if source.contains('(') {
-            let start_byte = u32::from(stmt.range().start()) as usize;
-            let close_rel = source.rfind(')')?;
-            let line_indent = source
-                .lines()
-                .rev()
-                .find(|line| line.trim_end().ends_with(')'))
-                .map(|line| {
-                    line.chars()
-                        .take_while(|ch| ch.is_whitespace())
-                        .collect::<String>()
-                })
-                .unwrap_or_default();
-            let item_indent = source
-                .lines()
-                .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with("from "))
-                .map(|line| {
-                    line.chars()
-                        .take_while(|ch| ch.is_whitespace())
-                        .collect::<String>()
-                })
-                .unwrap_or_else(|| format!("{}    ", line_indent));
-            let pos = byte_to_position(text, TextSize::new((start_byte + close_rel) as u32));
-            return Some(TextEdit {
-                range: Range {
-                    start: pos,
-                    end: pos,
-                },
-                new_text: format!("{}{},\n", item_indent, req.name),
-            });
-        }
-        let end = range_for_text_range(text, stmt.range()).end;
-        return Some(TextEdit {
-            range: Range { start: end, end },
-            new_text: format!(", {}", req.name),
-        });
-    }
-    None
 }
 
 fn import_insert_line(text: &str) -> u32 {
