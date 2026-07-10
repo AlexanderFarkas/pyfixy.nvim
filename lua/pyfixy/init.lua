@@ -12,7 +12,6 @@ end
 
 local defaults = {
   cmd = default_cmd(),
-  ty_client_names = { "ty" },
   name = "pyfixy-lsp",
   diagnostics = {
     missing_annotation = "hint",
@@ -23,19 +22,6 @@ local defaults = {
 }
 local config = vim.deepcopy(defaults)
 local started_by_root = {}
-
-local function is_ty(client)
-  for _, name in ipairs(config.ty_client_names) do
-    if client.name == name then
-      return true
-    end
-  end
-  return false
-end
-
-local function root_for(client)
-  return client.config and client.config.root_dir or client.root_dir
-end
 
 local function root_for_buf(bufnr)
   if config.root_dir then
@@ -73,7 +59,8 @@ end
 
 local function pyfixy_already_attached(bufnr, root)
   for _, client in ipairs(vim.lsp.get_clients({ bufnr = bufnr, name = config.name })) do
-    if root_for(client) == root then
+    local client_root = client.config and client.config.root_dir or client.root_dir
+    if client_root == root then
       return true
     end
   end
@@ -111,21 +98,9 @@ local function start_with_root(bufnr, root)
   end
 end
 
-local function start(bufnr, ty)
-  start_with_root(bufnr, root_for(ty))
-end
-
-
 local function maybe_start(bufnr)
   if vim.bo[bufnr].filetype ~= "python" then
     return
-  end
-
-  for _, client in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
-    if is_ty(client) then
-      start(bufnr, client)
-      return
-    end
   end
 
   start_with_root(bufnr, root_for_buf(bufnr))
@@ -133,16 +108,6 @@ end
 
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts or {})
-
-  vim.api.nvim_create_autocmd("LspAttach", {
-    group = vim.api.nvim_create_augroup("pyfixy_sidecar", { clear = true }),
-    callback = function(args)
-      local client = vim.lsp.get_client_by_id(args.data.client_id)
-      if client and is_ty(client) then
-        start(args.buf, client)
-      end
-    end,
-  })
 
   vim.api.nvim_create_autocmd("FileType", {
     group = vim.api.nvim_create_augroup("pyfixy_sidecar_filetype", { clear = true }),

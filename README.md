@@ -48,7 +48,7 @@ By default pyfixy starts for Python buffers under the nearest content root marke
 { "pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg", "setup.py", ".git" }
 ```
 
-If `ty` is already attached, pyfixy reuses ty's root. Otherwise it detects the root itself. You can override markers or provide a custom root callback:
+You can override markers or provide a custom root callback:
 
 ```lua
 require("pyfixy").setup({
