@@ -2,7 +2,7 @@
 
 A tiny Neovim + Rust LSP sidecar for pytest fixtures.
 
-`pyfixy.nvim` runs next to `ty` and provides pytest fixture-only LSP features:
+`pyfixy.nvim` provides pytest fixture-only LSP features:
 
 - completion for fixture names in test function parameters
 - go to definition from fixture parameter to fixture declaration
@@ -39,6 +39,25 @@ Not implemented yet:
 - plugin-provided fixtures
 - dynamic pytest fixture generation
 - incremental indexing
+
+## Root detection
+
+By default pyfixy starts for Python buffers under the nearest content root marked by one of:
+
+```lua
+{ "pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg", "setup.py", ".git" }
+```
+
+If `ty` is already attached, pyfixy reuses ty's root. Otherwise it detects the root itself. You can override markers or provide a custom root callback:
+
+```lua
+require("pyfixy").setup({
+  root_markers = { "pyproject.toml", ".git" },
+  root_dir = function(bufnr)
+    return vim.fs.root(vim.api.nvim_buf_get_name(bufnr), { "pyproject.toml" })
+  end,
+})
+```
 
 
 ## Releasing

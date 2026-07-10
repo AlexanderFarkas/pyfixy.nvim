@@ -18,6 +18,8 @@ local defaults = {
     missing_annotation = "hint",
     mismatched_annotation = "error",
   },
+  root_markers = { "pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg", "setup.py", ".git" },
+  root_dir = nil,
 }
 local config = vim.deepcopy(defaults)
 local started_by_root = {}
@@ -35,6 +37,40 @@ local function root_for(client)
   return client.config and client.config.root_dir or client.root_dir
 end
 
+local function root_for_buf(bufnr)
+  if config.root_dir then
+    local root = config.root_dir(bufnr)
+    if root and root ~= "" then
+      return vim.fs.normalize(root)
+    end
+  end
+
+  local name = vim.api.nvim_buf_get_name(bufnr)
+  if name == "" then
+    return nil
+  end
+
+  if vim.fs and vim.fs.root then
+    return vim.fs.root(name, config.root_markers)
+  end
+
+  local dir = vim.fn.fnamemodify(name, ":p:h")
+  while dir and dir ~= "" do
+    for _, marker in ipairs(config.root_markers) do
+      local candidate = dir .. "/" .. marker
+      if vim.loop.fs_stat(candidate) then
+        return dir
+      end
+    end
+    local parent = vim.fn.fnamemodify(dir, ":h")
+    if parent == dir then
+      break
+    end
+    dir = parent
+  end
+  return nil
+end
+
 local function pyfixy_already_attached(bufnr, root)
   for _, client in ipairs(vim.lsp.get_clients({ bufnr = bufnr, name = config.name })) do
     if root_for(client) == root then
@@ -44,12 +80,11 @@ local function pyfixy_already_attached(bufnr, root)
   return false
 end
 
-local function start(bufnr, ty)
+local function start_with_root(bufnr, root)
   if vim.bo[bufnr].filetype ~= "python" then
     return
   end
 
-  local root = root_for(ty)
   if not root or root == "" or pyfixy_already_attached(bufnr, root) then
     return
   end
@@ -76,6 +111,10 @@ local function start(bufnr, ty)
   end
 end
 
+local function start(bufnr, ty)
+  start_with_root(bufnr, root_for(ty))
+end
+
 
 local function maybe_start(bufnr)
   if vim.bo[bufnr].filetype ~= "python" then
@@ -88,6 +127,8 @@ local function maybe_start(bufnr)
       return
     end
   end
+
+  start_with_root(bufnr, root_for_buf(bufnr))
 end
 
 function M.setup(opts)
