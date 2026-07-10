@@ -193,12 +193,12 @@ impl FixtureIndex {
             .into_iter()
             .filter_map(|param| {
                 let fixture = visible.get(&param.name)?;
-                let fixture_annotation = fixture.return_annotation.as_ref()?;
+                let fixture_annotation = fixture_value_annotation(fixture)?;
                 match param.annotation {
                     std::option::Option::None => Some(FixtureAnnotationDiagnostic {
                         kind: AnnotationDiagnosticKind::Missing,
                         fixture_name: param.name,
-                        fixture_annotation: fixture_annotation.text.clone(),
+                        fixture_annotation: fixture_annotation.text,
                         range: param.name_range,
                         edit_range: param.name_range,
                     }),
@@ -214,7 +214,7 @@ impl FixtureIndex {
                         Some(FixtureAnnotationDiagnostic {
                             kind: AnnotationDiagnosticKind::Mismatched,
                             fixture_name: param.name,
-                            fixture_annotation: fixture_annotation.text.clone(),
+                            fixture_annotation: fixture_annotation.text,
                             range,
                             edit_range: range,
                         })
@@ -1444,6 +1444,79 @@ def test_two(db: str): pass
     }
 
     #[test]
+    fn fixture_annotation_diagnostics_unwrap_generator_yield_type() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+from collections.abc import AsyncGenerator
+from dishka import AsyncContainer
+
+@pytest.fixture
+async def create_di_container() -> AsyncGenerator[AsyncContainer]:
+    yield AsyncContainer()
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "from dishka import AsyncContainer
+
+def test_one(create_di_container: AsyncContainer): pass
+def test_two(create_di_container): pass
+";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let diags = index.annotation_diagnostics_for_text(&test, text).unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].kind, AnnotationDiagnosticKind::Missing);
+        assert_eq!(diags[0].fixture_annotation, "AsyncContainer");
+    }
+
+    #[test]
+    fn fixture_annotation_code_action_imports_unwrapped_generator_yield_type() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join("tests/conftest.py"),
+            "import pytest
+from collections.abc import AsyncGenerator
+from dishka import AsyncContainer
+
+@pytest.fixture
+async def create_di_container() -> AsyncGenerator[AsyncContainer]:
+    yield AsyncContainer()
+",
+        );
+        let test = tmp.path().join("tests/test_app.py");
+        let text = "def test_one(create_di_container): pass
+";
+        write(&test, text);
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let actions = index
+            .code_actions_for_text_range(&test, text, file_url(&test), None)
+            .unwrap();
+        let action = actions
+            .iter()
+            .find(|action| action.title == "Add fixture type annotation")
+            .unwrap();
+        let edits = action
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap();
+        assert!(edits.iter().any(|edit| edit.new_text == ": AsyncContainer"));
+        assert!(edits
+            .iter()
+            .any(|edit| edit.new_text.contains("from dishka import AsyncContainer")));
+        assert!(!edits
+            .iter()
+            .any(|edit| edit.new_text.contains("AsyncGenerator")));
+    }
+
+    #[test]
     fn code_actions_filter_to_requested_parameter_range() {
         let tmp = TempDir::new().unwrap();
         write(
@@ -2368,10 +2441,10 @@ fn edits_for_annotation(
     diag: &FixtureAnnotationDiagnostic,
     fixture: &Fixture,
 ) -> Vec<TextEdit> {
-    let Some(annotation) = &fixture.return_annotation else {
+    let Some(annotation) = fixture_value_annotation(fixture) else {
         return Vec::new();
     };
-    let mut edits = import_text_edits(text, annotation);
+    let mut edits = import_text_edits(text, &annotation);
     let new_text = match diag.kind {
         AnnotationDiagnosticKind::Missing => format!(": {}", diag.fixture_annotation),
         AnnotationDiagnosticKind::Mismatched => diag.fixture_annotation.clone(),
@@ -2433,6 +2506,95 @@ fn workspace_edit(uri: Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
         changes: Some(changes),
         ..Default::default()
     }
+}
+
+fn fixture_value_annotation(fixture: &Fixture) -> Option<FixtureAnnotation> {
+    let annotation = fixture.return_annotation.as_ref()?;
+    let text = unwrap_fixture_value_annotation(&annotation.text)
+        .unwrap_or_else(|| annotation.text.clone());
+    let imports = annotation
+        .imports
+        .iter()
+        .filter(|import| annotation_uses_import(&text, import))
+        .cloned()
+        .collect();
+    Some(FixtureAnnotation { text, imports })
+}
+
+fn unwrap_fixture_value_annotation(annotation: &str) -> Option<String> {
+    let normalized = annotation.split_whitespace().collect::<String>();
+    let bracket_start = normalized.find('[')?;
+    let bracket_end = normalized.rfind(']')?;
+    if bracket_end <= bracket_start {
+        return None;
+    }
+    let wrapper = normalized[..bracket_start].rsplit('.').next()?;
+    if !matches!(
+        wrapper,
+        "Generator" | "Iterator" | "AsyncGenerator" | "AsyncIterator"
+    ) {
+        return None;
+    }
+    split_top_level_args(&normalized[bracket_start + 1..bracket_end])
+        .into_iter()
+        .next()
+        .filter(|arg| !arg.is_empty())
+}
+
+fn split_top_level_args(args: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut depth = 0i32;
+    for (idx, ch) in args.char_indices() {
+        match ch {
+            '[' | '(' | '{' => depth += 1,
+            ']' | ')' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                result.push(args[start..idx].trim().to_string());
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    result.push(args[start..].trim().to_string());
+    result
+}
+
+fn annotation_uses_import(annotation: &str, import: &ImportRequirement) -> bool {
+    let visible = import
+        .alias
+        .as_deref()
+        .or_else(|| {
+            if import.name.is_empty() {
+                import.module.split('.').next_back()
+            } else {
+                Some(import.name.as_str())
+            }
+        })
+        .unwrap_or_default();
+    contains_word(annotation, visible)
+}
+
+fn contains_word(text: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if (bytes[i] == b'_' || bytes[i].is_ascii_alphabetic())
+            && text.get(i..).is_some_and(|suffix| suffix.starts_with(word))
+        {
+            let end = i + word.len();
+            let before_ok = i == 0 || !is_ident(bytes[i - 1]);
+            let after_ok = end >= bytes.len() || !is_ident(bytes[end]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn annotations_equivalent(
