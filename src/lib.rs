@@ -423,7 +423,7 @@ fn imported_fixture_sources_from_text(
     text: &str,
     root: &Path,
 ) -> Result<HashMap<String, HashSet<PathBuf>>> {
-    let Ok(parsed) = parse_module(&text) else {
+    let Ok(parsed) = parse_module(text) else {
         return Ok(HashMap::new());
     };
     if parsed.has_invalid_syntax() {
@@ -455,36 +455,69 @@ fn imported_fixture_sources_from_text(
 }
 
 fn pytest_plugin_modules(file: &Path) -> Result<Vec<String>> {
-    let text = fs::read_to_string(file)?;
     let mut modules = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("pytest_plugins") {
-            continue;
+    for path in pytest_plugin_config_files(file) {
+        modules.extend(pytest_plugin_modules_in_file(&path)?);
+    }
+    Ok(modules)
+}
+
+fn pytest_plugin_config_files(file: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    paths.push(file.to_path_buf());
+
+    let mut dir = file.parent();
+    while let Some(current) = dir {
+        let conftest = current.join("conftest.py");
+        if conftest.exists() {
+            paths.push(conftest);
         }
-        for quoted in extract_quoted_strings(trimmed) {
-            modules.push(quoted);
+        dir = current.parent();
+    }
+
+    paths
+}
+
+fn pytest_plugin_modules_in_file(file: &Path) -> Result<Vec<String>> {
+    let text = fs::read_to_string(file)?;
+    let Ok(parsed) = parse_module(text.as_str()) else {
+        return Ok(Vec::new());
+    };
+    if parsed.has_invalid_syntax() {
+        return Ok(Vec::new());
+    }
+
+    let mut modules = Vec::new();
+    for stmt in &parsed.syntax().body {
+        let Stmt::Assign(assign) = stmt else {
+            continue;
+        };
+        if assign.targets.iter().any(is_pytest_plugins_target) {
+            collect_pytest_plugin_module_exprs(assign.value.as_ref(), &mut modules);
         }
     }
     Ok(modules)
 }
 
-fn extract_quoted_strings(text: &str) -> Vec<String> {
-    let mut strings = Vec::new();
-    let mut chars = text.char_indices().peekable();
-    while let Some((start, ch)) = chars.next() {
-        if ch != '\'' && ch != '"' {
-            continue;
-        }
-        let quote = ch;
-        for (end, next) in chars.by_ref() {
-            if next == quote {
-                strings.push(text[start + 1..end].to_string());
-                break;
+fn is_pytest_plugins_target(expr: &Expr) -> bool {
+    matches!(expr, Expr::Name(ExprName { id, .. }) if id == "pytest_plugins")
+}
+
+fn collect_pytest_plugin_module_exprs(expr: &Expr, modules: &mut Vec<String>) {
+    match expr {
+        Expr::StringLiteral(ExprStringLiteral { value, .. }) => modules.push(value.to_string()),
+        Expr::List(list) => {
+            for elt in &list.elts {
+                collect_pytest_plugin_module_exprs(elt, modules);
             }
         }
+        Expr::Tuple(tuple) => {
+            for elt in &tuple.elts {
+                collect_pytest_plugin_module_exprs(elt, modules);
+            }
+        }
+        _ => {}
     }
-    strings
 }
 
 fn module_to_path(root: &Path, module: &str) -> Option<PathBuf> {
@@ -572,7 +605,7 @@ fn expand_conftest_reexports(root: &Path, fixtures: &mut Vec<Fixture>) -> Result
 
 fn import_specs(file: &Path, root: &Path) -> Result<Vec<ImportSpec>> {
     let text = fs::read_to_string(file)?;
-    let Ok(parsed) = parse_module(&text) else {
+    let Ok(parsed) = parse_module(text.as_str()) else {
         return Ok(Vec::new());
     };
     if parsed.has_invalid_syntax() {
@@ -1269,19 +1302,54 @@ mod tests {
         let test = tmp.path().join("tests/test_app.py");
         write(
             &test,
-            "pytest_plugins = ['tests.plugins.db']\n\ndef test_thing(): pass\n",
+            "pytest_plugins = [\n    'tests.plugins.db',\n]\n\ndef test_thing(plugin_db): pass\n",
         );
         let index = FixtureIndex::build(tmp.path()).unwrap();
-        let items = index
-            .completions(
+        let location = index
+            .definition(
                 &test,
                 Position {
-                    line: 2,
-                    character: 15,
+                    line: 4,
+                    character: 17,
                 },
             )
+            .unwrap()
             .unwrap();
-        assert!(items.iter().any(|item| item.label == "plugin_db"));
+        assert_eq!(location.uri, file_url(plugin));
+    }
+
+    #[test]
+    fn ancestor_conftest_pytest_plugins_fixture_is_visible() {
+        let tmp = TempDir::new().unwrap();
+        let plugin = tmp.path().join("tests/cohorts/integration.py");
+        write(
+            &plugin,
+            "import pytest\n@pytest.fixture\ndef integration_env(): pass\n",
+        );
+        write(
+            &tmp.path().join("app/modules/conftest.py"),
+            "pytest_plugins = [\n    'tests.cohorts.integration',\n]\n",
+        );
+        let test = tmp
+            .path()
+            .join("app/modules/evaluations/tests/test_eval.py");
+        write(
+            &test,
+            "def test_thing(\n    integration_env: Settings,\n): pass\n",
+        );
+
+        let index = FixtureIndex::build(tmp.path()).unwrap();
+        let location = index
+            .definition(
+                &test,
+                Position {
+                    line: 1,
+                    character: 5,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(location.uri, file_url(plugin));
     }
 
     #[test]
