@@ -32,11 +32,11 @@ Supported so far:
 - `@fixture`
 - fixtures in the same test file
 - fixtures in ancestor `conftest.py` files
+- fixture imports/re-exports across helper modules
+- plugin-provided fixtures declared via `pytest_plugins` in the test file or ancestor `conftest.py` files
 
 Not implemented yet:
 
-- fixture imports/re-exports across helper modules
-- plugin-provided fixtures
 - dynamic pytest fixture generation
 - incremental indexing
 
